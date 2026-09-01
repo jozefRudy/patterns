@@ -1,0 +1,55 @@
+[package]
+name = "patterns"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+missing_errors_doc = "allow"
+
+# DENY PANICS
+unwrap_used = "deny"
+string_slice = "deny"
+indexing_slicing = "deny"
+as_conversions = "deny"
+panic = "deny"
+panic_in_result_fn = "deny"
+exit = "deny"
+get_unwrap = "deny"
+unwrap_in_result = "deny"
+unchecked_time_subtraction = "deny"
+
+# Don't Fail Silently - prevent dropped futures and swallowed errors
+let_underscore_future = "deny"
+map_err_ignore = "deny"
+let_underscore_must_use = "deny"
+unused_result_ok = "deny"
+assertions_on_result_states = "deny"
+
+# Don't Do Potentially Incorrect Things with Numbers
+float_cmp = "deny"
+float_cmp_const = "deny"
+lossy_float_literal = "deny"
+cast_sign_loss = "deny"
+invalid_upcast_comparisons = "deny"
+
+# async
+await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"
+large_futures = "deny"          # may be nursery alrea
+
+# Don't Do Bad Things That are Easy to Avoid
+rc_mutex = "deny"
+dbg_macro = "deny"
+
+# enforce AGENTS.md "no #[allow(clippy::*)]" mechanically
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+
+# reference https://emschwartz.me/your-clippy-config-should-be-stricter/#my-configs

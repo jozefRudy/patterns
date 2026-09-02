@@ -15,11 +15,11 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::timeout;
 
-/// Per-call timeout for the LLM CLI.
+/// Default per-call timeout for the LLM CLI.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Maximum byte length of text embedded into prompts.
-pub const MAX_TEXT_LEN: usize = 4000;
+/// Default maximum byte length of text embedded into prompts.
+pub const DEFAULT_MAX_TEXT_LEN: usize = 4000;
 
 /// A type that can be extracted from LLM output.
 ///
@@ -46,6 +46,8 @@ pub struct LlmExtractor<T: Extractable> {
     bin: String,
     args: Vec<String>,
     prompt_context: String,
+    max_text_len: usize,
+    timeout: Duration,
     // `fn() -> T`: covariant marker, keeps LlmExtractor Send + Sync regardless of T
     _phantom: PhantomData<fn() -> T>,
 }
@@ -54,8 +56,8 @@ impl<T: Extractable> LlmExtractor<T> {
     /// Extract structured data from `text`.
     pub async fn extract(&self, text: &str) -> Result<T> {
         let schema = serde_json::to_string_pretty(&schema_for!(T))?;
-        let truncated = truncate(text);
-        let rendered = T::render_prompt(&schema, &truncated, &self.prompt_context)?;
+        let truncated = truncate(text, self.max_text_len);
+        let rendered = T::render_prompt(&schema, truncated, &self.prompt_context)?;
         self.run_and_parse::<T>(&rendered).await
     }
 
@@ -63,6 +65,21 @@ impl<T: Extractable> LlmExtractor<T> {
     #[must_use]
     pub fn with_prompt_context(mut self, context: String) -> Self {
         self.prompt_context = context;
+        self
+    }
+
+    /// Override the maximum byte length of text embedded into prompts
+    /// (default: [`DEFAULT_MAX_TEXT_LEN`]).
+    #[must_use]
+    pub const fn with_max_text_len(mut self, max_text_len: usize) -> Self {
+        self.max_text_len = max_text_len;
+        self
+    }
+
+    /// Override the per-call timeout for the LLM CLI (default: [`DEFAULT_TIMEOUT`]).
+    #[must_use]
+    pub const fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
         self
     }
 
@@ -84,6 +101,8 @@ impl<T: Extractable> LlmExtractor<T> {
             bin,
             args,
             prompt_context: String::new(),
+            max_text_len: DEFAULT_MAX_TEXT_LEN,
+            timeout: DEFAULT_TIMEOUT,
             _phantom: PhantomData,
         }
     }
@@ -98,7 +117,8 @@ impl<T: Extractable> LlmExtractor<T> {
         match self.try_parse(prompt).await {
             Ok(parsed) => Ok(parsed),
             Err(failure) => {
-                let repair = build_repair_prompt(prompt, &failure.output, &failure.error);
+                let repair =
+                    build_repair_prompt(prompt, &failure.output, &failure.error, self.max_text_len);
                 self.try_parse(&repair).await.map_err(|retry| {
                     retry.error.context(format!(
                         "llm parse failed after one retry; first error: {}; first output: {}",
@@ -136,7 +156,7 @@ impl<T: Extractable> LlmExtractor<T> {
         cmd.args(&self.args);
         cmd.arg(prompt);
 
-        let output = timeout(DEFAULT_TIMEOUT, cmd.output())
+        let output = timeout(self.timeout, cmd.output())
             .await
             .context("llm extractor timed out")?
             .context("failed to run llm extractor")?;
@@ -160,12 +180,15 @@ struct ParseFailure {
     output: String,
 }
 
-fn truncate(text: &str) -> String {
-    let mut s = text.to_string();
-    while s.len() > MAX_TEXT_LEN {
-        s.pop();
+fn truncate(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
     }
-    s
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.get(..end).expect("end is char boundary")
 }
 
 const REPAIR_PROMPT: &str = include_str!("prompts/repair.md");
@@ -178,10 +201,14 @@ fn build_repair_prompt(
     original_prompt: &str,
     previous_output: &str,
     error: &anyhow::Error,
+    max_text_len: usize,
 ) -> String {
     REPAIR_PROMPT
         .replace(PLACEHOLDER_ORIGINAL, original_prompt)
-        .replace(PLACEHOLDER_PREVIOUS, &truncate(previous_output))
+        .replace(
+            PLACEHOLDER_PREVIOUS,
+            truncate(previous_output, max_text_len),
+        )
         .replace(PLACEHOLDER_ERROR, &format!("{error:#}"))
 }
 
@@ -222,21 +249,33 @@ mod tests {
     #[test]
     fn test_truncate_respects_char_boundaries() {
         let s = "αβγδ".repeat(1000);
-        let t = truncate(&s);
-        assert!(t.len() <= MAX_TEXT_LEN);
+        let t = truncate(&s, DEFAULT_MAX_TEXT_LEN);
+        assert!(t.len() <= DEFAULT_MAX_TEXT_LEN);
         assert!(t.is_char_boundary(t.len()));
     }
 
     #[test]
     fn test_truncate_leaves_short_text() {
         let s = "short";
-        assert_eq!(truncate(s), s);
+        assert_eq!(truncate(s, DEFAULT_MAX_TEXT_LEN), s);
+    }
+
+    #[test]
+    fn test_truncate_respects_custom_limit() {
+        let s = "abcdef";
+        assert_eq!(truncate(s, 3), "abc");
+        assert_eq!(truncate(s, 100), s);
     }
 
     #[test]
     fn test_build_repair_prompt_contains_context() {
         let err = anyhow::anyhow!("expected value at line 1 column 2");
-        let prompt = build_repair_prompt("ORIGINAL PROMPT", "not json at all", &err);
+        let prompt = build_repair_prompt(
+            "ORIGINAL PROMPT",
+            "not json at all",
+            &err,
+            DEFAULT_MAX_TEXT_LEN,
+        );
         assert!(prompt.contains("ORIGINAL PROMPT"));
         assert!(prompt.contains("not json at all"));
         assert!(prompt.contains("expected value at line 1 column 2"));
@@ -246,9 +285,9 @@ mod tests {
     #[test]
     fn test_build_repair_prompt_truncates_long_output() {
         let err = anyhow::anyhow!("boom");
-        let long = "x".repeat(MAX_TEXT_LEN * 2);
-        let prompt = build_repair_prompt("p", &long, &err);
-        assert!(!prompt.contains(&"x".repeat(MAX_TEXT_LEN + 1)));
+        let long = "x".repeat(DEFAULT_MAX_TEXT_LEN * 2);
+        let prompt = build_repair_prompt("p", &long, &err, 100);
+        assert_eq!(prompt.matches('x').count(), 100);
     }
 
     #[test]
@@ -276,6 +315,18 @@ mod tests {
         assert_eq!(e.bin, "");
         assert!(e.args.is_empty(), "args: {:?}", e.args);
     }
+
+    #[test]
+    fn test_builder_defaults_and_overrides() {
+        let e = LlmExtractor::<Dummy>::from_bin("llm");
+        assert_eq!(e.max_text_len, DEFAULT_MAX_TEXT_LEN);
+        assert_eq!(e.timeout, DEFAULT_TIMEOUT);
+        let e = e
+            .with_max_text_len(50_000)
+            .with_timeout(Duration::from_secs(90));
+        assert_eq!(e.max_text_len, 50_000);
+        assert_eq!(e.timeout, Duration::from_secs(90));
+    }
 }
 
 /// End-to-end tests against a fake CLI implemented as a shell script.
@@ -283,6 +334,7 @@ mod tests {
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+    use serde::Serialize;
 
     fn fake_cli(dir: &tempfile::TempDir, body: &str) -> String {
         let path = dir.path().join("fake.sh");
@@ -305,6 +357,56 @@ if [ "$c" -eq 0 ]; then echo 'not json'; else echo '{"value":"fixed"}'; fi
             .trim()
             .parse()
             .expect("count is a number")
+    }
+
+    /// Extractor whose prompt embeds the input text verbatim (as JSON), so a
+    /// CLI echoing its argument reveals exactly what text reached the prompt.
+    #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+    struct Echo {
+        text: String,
+    }
+
+    impl Extractable for Echo {
+        const HEALTHCHECK_TEXT: &'static str = "hi";
+
+        fn render_prompt(_schema: &str, text: &str, _ctx: &str) -> Result<String> {
+            Ok(serde_json::to_string(&Self {
+                text: text.to_string(),
+            })?)
+        }
+
+        fn verify(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_default_max_text_len_applied() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let e = LlmExtractor::<Echo>::from_bin(&fake_cli(&dir, "echo \"$1\""));
+        let long = "x".repeat(DEFAULT_MAX_TEXT_LEN * 2);
+        let d = e.extract(&long).await.expect("extract");
+        assert_eq!(d.text.len(), DEFAULT_MAX_TEXT_LEN);
+    }
+
+    #[tokio::test]
+    async fn test_max_text_len_override_applied() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let e =
+            LlmExtractor::<Echo>::from_bin(&fake_cli(&dir, "echo \"$1\"")).with_max_text_len(100);
+        let long = "x".repeat(250);
+        let d = e.extract(&long).await.expect("extract");
+        assert_eq!(d.text, "x".repeat(100));
+    }
+
+    #[tokio::test]
+    async fn test_timeout_override_applied() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let e =
+            LlmExtractor::<Dummy>::from_bin(&fake_cli(&dir, "sleep 2; echo '{\"value\":\"ok\"}'"))
+                .with_timeout(Duration::from_millis(100));
+        let err = e.extract("text").await.expect_err("must time out");
+        assert!(format!("{err:#}").contains("timed out"), "err: {err:#}");
     }
 
     #[tokio::test]

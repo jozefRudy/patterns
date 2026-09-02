@@ -73,14 +73,17 @@ Post:
 
 ```rust
 impl patterns::llm_cli::Extractable for JobAd {
-    const HEALTHCHECK_TEXT: &'static str = "Senior Rust dev, fully remote";
+    const HEALTHCHECK_TEXT: &'static str = "Senior Rust dev, fully remote, EUR 80k-100k";
 
     fn render_prompt(schema: &str, text: &str, prompt_context: &str) -> anyhow::Result<String> {
         PromptKind::JobAdExtract.render_prompt(schema, text, prompt_context)
     }
 
+    // semantic smoke test on the known healthcheck text — proves the model
+    // understands the task, not just that it emits schema-valid JSON
     fn verify(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(!self.title.is_empty(), "empty title");
+        anyhow::ensure!(self.title.to_lowercase().contains("rust"), "bad title");
+        anyhow::ensure!(self.remote == Some(true), "remote not detected");
         Ok(())
     }
 }

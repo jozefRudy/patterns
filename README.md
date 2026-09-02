@@ -27,7 +27,8 @@ Consumer defines three things:
 
 **1. Output struct** — `#[schemars(description = ...)]` per field; these land
 in the JSON schema rendered into the prompt and steer the LLM. Describe
-meaning, nullability rules, format examples.
+meaning, nullability rules, format examples. `Option<T>` fields render as
+nullable in the schema and serde accepts `null` *or* omission.
 
 ```rust
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -57,7 +58,6 @@ patterns::define_prompts!((JobAdExtract, "prompts/job_ad.md"));
 ```md
 You extract structured data from job postings.
 Return ONLY valid JSON with no markdown and no explanation.
-Use null for missing values.
 
 JSON schema:
 {{ schema }}
@@ -73,8 +73,15 @@ Post:
 
 ```rust
 impl patterns::llm_cli::Extractable for JobAd {
+    const HEALTHCHECK_TEXT: &'static str = "Senior Rust dev, fully remote";
+
     fn render_prompt(schema: &str, text: &str, prompt_context: &str) -> anyhow::Result<String> {
         PromptKind::JobAdExtract.render_prompt(schema, text, prompt_context)
+    }
+
+    fn verify(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.title.is_empty(), "empty title");
+        Ok(())
     }
 }
 ```

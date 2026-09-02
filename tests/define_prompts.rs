@@ -4,7 +4,7 @@
 use patterns::define_prompts;
 
 define_prompts! {
-    (Test, TestPrompt, "test_fields.md"),
+    (Test, "test_fields.md"),
 }
 
 #[test]

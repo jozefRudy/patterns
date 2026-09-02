@@ -69,7 +69,7 @@ Post:
 {{ text }}
 ```
 
-**3. `Extractable` impl** — glue plus healthcheck.
+**3. `Extractable` impl**
 
 ```rust
 impl patterns::llm_cli::Extractable for JobAd {

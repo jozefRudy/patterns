@@ -21,6 +21,8 @@ tokio = { version = "1", features = ["macros", "rt"] }
 pedantic = { level = "deny", priority = -1 }
 nursery = { level = "deny", priority = -1 }
 missing_errors_doc = "allow"
+# style lints not covered by pedantic/nursery; auto-fixable, no false positives
+needless_borrow = "deny"
 
 # DENY PANICS
 unwrap_used = "deny"

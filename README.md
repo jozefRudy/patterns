@@ -15,7 +15,7 @@ Usage:
 ## `llm_cli` usage
 
 Shell out to any local LLM CLI that takes the rendered prompt as its **last
-argument** and prints JSON to stdout (```json fences stripped). Entry point is
+argument** and prints JSON to stdout (markdown `json` code fences stripped). Entry point is
 `SharedLlm`: a cloneable handle holding the command string plus a process-wide
 concurrency cap (`Arc<Semaphore>` — `Clone` + `Send` + `Sync`, no locks). The
 cap only works if all callers share one handle. Limits are app policy, passed

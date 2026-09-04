@@ -5,7 +5,8 @@ via a pinned git dependency. One crate, module per pattern.
 
 Modules:
 - `llm_cli` — structured extraction from text via a local LLM CLI, with
-  one-repair-retry semantics. Prompt templating stays in consumers.
+  one-repair-retry semantics, via `SharedLlm`: a cloneable handle with a
+  process-wide concurrency cap. Prompt templating stays in consumers.
 - `lance_store` — reserved.
 
 Usage:
@@ -14,12 +15,20 @@ Usage:
 ## `llm_cli` usage
 
 Shell out to any local LLM CLI that takes the rendered prompt as its **last
-argument** and prints JSON to stdout (```json fences stripped). Configure with
-a command string, e.g. from a `[llm] bin` config entry:
+argument** and prints JSON to stdout (```json fences stripped). Entry point is
+`SharedLlm`: a cloneable handle holding the command string plus a process-wide
+concurrency cap (`Arc<Semaphore>` — `Clone` + `Send` + `Sync`, no locks). The
+cap only works if all callers share one handle. Limits are app policy, passed
+at construction (env var reading stays in the consumer):
 
 ```rust
-let extractor = LlmExtractor::<JobAd>::from_bin(
-    "pi --print --no-session --no-tools --no-extensions --mode text --thinking off --model deepseek/deepseek-v4-flash",
+let llm = SharedLlm::new(
+    "pi --print --no-session --no-tools --no-extensions --mode text --thinking off --model deepseek/deepseek-v4-flash".into(),
+    SharedLimits {
+        max_concurrent_calls: 2,
+        max_text_len: 4000,
+        call_timeout: Duration::from_secs(30),
+    },
 );
 ```
 
@@ -93,9 +102,8 @@ impl patterns::llm_cli::Extractable for JobAd {
 Then:
 
 ```rust
-let job: JobAd = extractor
-    .with_prompt_context("prefer EU-based roles".into())
-    .extract(&posting_text)
+let job: JobAd = llm
+    .extract(&posting_text, "prefer EU-based roles".into())
     .await?;
 // JobAd { title: "Senior Rust Developer", remote: Some(true),
 //         salary: Some("EUR 80k-100k".into()), tags: ["rust", "backend"] }
@@ -107,7 +115,7 @@ trigger the repair retry below. You never touch untyped JSON yourself.
 
 ## Healthcheck as a batch gate
 
-`LlmExtractor::verify()` runs the **whole pipeline** (prompt → subprocess →
+`SharedLlm::verify::<T>()` runs the **whole pipeline** (prompt → subprocess →
 parse) on `T::HEALTHCHECK_TEXT` — a fixture with a known-correct answer —
 and asserts `T::verify()` on the result. It validates the *system*, not the
 data: prompt wording regressions, model swaps/fallbacks, JSON-mode breakage,
@@ -119,9 +127,9 @@ pattern:
 
 ```rust
 // at batch start; on failure skip the batch and retry next tick
-extractor.verify::<JobAd>().await?;   // or extractor.verify::<T>() on LlmExtractor
+llm.verify::<JobAd>().await?;
 for item in items {
-    let out = extractor.extract::<JobAd>(&item.text, ctx).await?;
+    let out: JobAd = llm.extract(&item.text, ctx).await?;
     ...
 }
 ```

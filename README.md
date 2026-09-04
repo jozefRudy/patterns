@@ -44,9 +44,10 @@ struct JobAd {
 }
 ```
 
-**2. Prompt template** — hand-written askama file in the consumer's
-`templates/` dir, registered via `define_prompts!`. Templates are strongly
-typed: exactly `{{ schema }}`, `{{ text }}`, `{{ prompt_context }}` available,
+**2. Prompt template** — `render_prompt` is free-form; consumers either hand
+roll it (simple `format!` compositions) or use strongly typed askama
+templates registered via `define_prompts!`. Templates are strongly typed:
+exactly `{{ schema }}`, `{{ text }}`, `{{ prompt_context }}` available,
 compile error otherwise.
 
 ```rust
@@ -103,5 +104,30 @@ let job: JobAd = extractor
 Extraction is strongly typed: the LLM's raw JSON is deserialized straight
 into `T` via serde — unknown/missing/wrong-typed fields fail parsing and
 trigger the repair retry below. You never touch untyped JSON yourself.
+
+## Healthcheck as a batch gate
+
+`LlmExtractor::verify()` runs the **whole pipeline** (prompt → subprocess →
+parse) on `T::HEALTHCHECK_TEXT` — a fixture with a known-correct answer —
+and asserts `T::verify()` on the result. It validates the *system*, not the
+data: prompt wording regressions, model swaps/fallbacks, JSON-mode breakage,
+parse drift, auth degradation.
+
+Call it **once per batch, before the pass** — never per item (it costs one
+full LLM round-trip and proves nothing new per row). Standard consumer
+pattern:
+
+```rust
+// at batch start; on failure skip the batch and retry next tick
+extractor.verify::<JobAd>().await?;   // or extractor.verify::<T>() on LlmExtractor
+for item in items {
+    let out = extractor.extract::<JobAd>(&item.text, ctx).await?;
+    ...
+}
+```
+
+A failing healthcheck is a loud tripwire *before* a batch burns — a broken
+pipeline otherwise surfaces as silent parse failures (or worse, silently
+wrong rows) across every item in the run.
 
 License: MIT.

@@ -150,10 +150,28 @@ impl<T: Extractable> LlmExtractor<T> {
         })
     }
 
-    async fn run(&self, prompt: &str) -> Result<Option<String>> {
+    /// Child process setup: bin + args + prompt, stdin pinned to /dev/null.
+    ///
+    /// tokio's `output()` inherits stdin by default — a closed fd (parent
+    /// launched via nohup/systemd) makes node-based CLIs crash with
+    /// `EBADF: bad file descriptor, read` on their stdin `ReadStream` (seen
+    /// live with `pi --print`).
+    ///
+    /// NOTE: `Stdio::null()` is NOT sufficient — when the parent's fd 0 is
+    /// closed, std's lazy devnull handling still leaves the child with a bad
+    /// fd 0 (verified on macOS, std + tokio alike). Opening /dev/null eagerly
+    /// and passing the File works in all cases. Repro: `tests/stdin_null.rs`.
+    fn build_cmd(&self, prompt: &str) -> Command {
         let mut cmd = Command::new(&self.bin);
         cmd.args(&self.args);
         cmd.arg(prompt);
+        let devnull = std::fs::File::open("/dev/null").expect("open /dev/null for child stdin");
+        cmd.stdin(std::process::Stdio::from(devnull));
+        cmd
+    }
+
+    async fn run(&self, prompt: &str) -> Result<Option<String>> {
+        let mut cmd = self.build_cmd(prompt);
 
         let output = timeout(self.timeout, cmd.output())
             .await

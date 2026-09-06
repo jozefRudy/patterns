@@ -45,7 +45,7 @@ pub trait Extractable: JsonSchema + for<'de> Deserialize<'de> {
 /// Generic LLM extractor that calls a local CLI.
 ///
 /// Crate-internal engine behind [`SharedLlm`]; not part of the public API.
-/// Configure with a command string via [`LlmExtractor::from_bin`].
+/// Configure with a bin path + args via [`LlmExtractor::from_parts`].
 #[derive(Debug, Clone)]
 pub(crate) struct LlmExtractor<T: Extractable> {
     bin: String,
@@ -88,14 +88,9 @@ impl<T: Extractable> LlmExtractor<T> {
         self
     }
 
-    /// Configure with a command string, e.g. `"llm -m claude-4-sonnet"`.
+    /// Configure with a bin path and pre-split args.
     #[must_use]
-    pub fn from_bin(llm_bin: &str) -> Self {
-        let tokens = shell_words::split(llm_bin).unwrap_or_default();
-        let (bin, args) = tokens
-            .split_first()
-            .map(|(h, t)| (h.clone(), t.to_vec()))
-            .unwrap_or_default();
+    pub fn from_parts(bin: String, args: Vec<String>) -> Self {
         Self {
             bin,
             args,
@@ -226,16 +221,19 @@ impl Default for SharedLimits {
 #[derive(Debug, Clone)]
 pub struct SharedLlm {
     bin: String,
+    args: Vec<String>,
     limits: SharedLimits,
     permits: Arc<Semaphore>,
 }
 
 impl SharedLlm {
-    /// Build from a command string (e.g. `"pi --print"`) and limits.
+    /// Build from a bin path, pre-split args, and limits (breaking: old
+    /// single-command-string ctor removed; `job_search` stays on pinned rev).
     #[must_use]
-    pub fn new(bin: String, limits: SharedLimits) -> Self {
+    pub fn new(bin: String, args: Vec<String>, limits: SharedLimits) -> Self {
         Self {
             bin,
+            args,
             permits: Arc::new(Semaphore::new(limits.max_concurrent_calls)),
             limits,
         }
@@ -256,7 +254,7 @@ impl SharedLlm {
             .acquire()
             .await
             .context("LLM semaphore closed")?;
-        LlmExtractor::<T>::from_bin(&self.bin)
+        LlmExtractor::<T>::from_parts(self.bin.clone(), self.args.clone())
             .with_prompt_context(context)
             .with_max_text_len(self.limits.max_text_len)
             .with_timeout(self.limits.call_timeout)
@@ -405,22 +403,29 @@ mod tests {
     }
 
     #[test]
-    fn test_from_bin_parses_command_string() {
-        let e = LlmExtractor::<Dummy>::from_bin("llm -m sonnet --flag 'quoted arg'");
+    fn test_from_parts_keeps_args_verbatim() {
+        let e = LlmExtractor::<Dummy>::from_parts(
+            "llm".to_owned(),
+            vec![
+                "-m".to_owned(),
+                "sonnet".to_owned(),
+                "quoted arg".to_owned(),
+            ],
+        );
         assert_eq!(e.bin, "llm");
-        assert_eq!(e.args, vec!["-m", "sonnet", "--flag", "quoted arg"]);
+        assert_eq!(e.args, vec!["-m", "sonnet", "quoted arg"]);
     }
 
     #[test]
-    fn test_from_bin_empty_string() {
-        let e = LlmExtractor::<Dummy>::from_bin("");
+    fn test_from_parts_empty() {
+        let e = LlmExtractor::<Dummy>::from_parts(String::new(), vec![]);
         assert_eq!(e.bin, "");
         assert!(e.args.is_empty(), "args: {:?}", e.args);
     }
 
     #[test]
     fn test_builder_defaults_and_overrides() {
-        let e = LlmExtractor::<Dummy>::from_bin("llm");
+        let e = LlmExtractor::<Dummy>::from_parts("llm".to_owned(), vec![]);
         assert_eq!(e.max_text_len, DEFAULT_MAX_TEXT_LEN);
         assert_eq!(e.timeout, DEFAULT_TIMEOUT);
         let e = e
@@ -431,17 +436,24 @@ mod tests {
     }
 }
 
-/// End-to-end tests against a fake CLI implemented as a shell script.
+/// End-to-end tests against a fake LLM CLI ("pi") implemented as a shell script.
 /// The prompt is passed as the last argument; scripts ignore it.
 #[cfg(test)]
 mod cli_tests {
     use super::*;
     use serde::Serialize;
 
-    fn fake_cli(dir: &tempfile::TempDir, body: &str) -> String {
-        let path = dir.path().join("fake.sh");
+    /// Fake LLM CLI ("pi") as (bin, args); the prompt is passed as the last argument,
+    /// scripts ignore it.
+    fn fake_pi(dir: &tempfile::TempDir, body: &str) -> (String, Vec<String>) {
+        let path = dir.path().join("fake_pi.sh");
         std::fs::write(&path, body).expect("write fake cli script");
-        format!("sh {}", path.display())
+        ("sh".to_owned(), vec![path.display().to_string()])
+    }
+    /// Destructure the `fake_pi` tuple into a `from_parts` call.
+    fn pi_extractor<T: Extractable>(cli: (String, Vec<String>)) -> LlmExtractor<T> {
+        let (b, a) = cli;
+        LlmExtractor::from_parts(b, a)
     }
 
     /// Script that emits invalid JSON on first invocation, valid JSON after,
@@ -485,7 +497,7 @@ if [ "$c" -eq 0 ]; then echo 'not json'; else echo '{"value":"fixed"}'; fi
     #[tokio::test]
     async fn test_default_max_text_len_applied() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let e = LlmExtractor::<Echo>::from_bin(&fake_cli(&dir, "echo \"$1\""));
+        let e = pi_extractor::<Echo>(fake_pi(&dir, "echo \"$1\""));
         let long = "x".repeat(DEFAULT_MAX_TEXT_LEN * 2);
         let d = e.extract(&long).await.expect("extract");
         assert_eq!(d.text.len(), DEFAULT_MAX_TEXT_LEN);
@@ -494,8 +506,7 @@ if [ "$c" -eq 0 ]; then echo 'not json'; else echo '{"value":"fixed"}'; fi
     #[tokio::test]
     async fn test_max_text_len_override_applied() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let e =
-            LlmExtractor::<Echo>::from_bin(&fake_cli(&dir, "echo \"$1\"")).with_max_text_len(100);
+        let e = pi_extractor::<Echo>(fake_pi(&dir, "echo \"$1\"")).with_max_text_len(100);
         let long = "x".repeat(250);
         let d = e.extract(&long).await.expect("extract");
         assert_eq!(d.text, "x".repeat(100));
@@ -504,9 +515,8 @@ if [ "$c" -eq 0 ]; then echo 'not json'; else echo '{"value":"fixed"}'; fi
     #[tokio::test]
     async fn test_timeout_override_applied() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let e =
-            LlmExtractor::<Dummy>::from_bin(&fake_cli(&dir, "sleep 2; echo '{\"value\":\"ok\"}'"))
-                .with_timeout(Duration::from_millis(100));
+        let e = pi_extractor::<Dummy>(fake_pi(&dir, "sleep 2; echo '{\"value\":\"ok\"}'"))
+            .with_timeout(Duration::from_millis(100));
         let err = e.extract("text").await.expect_err("must time out");
         assert!(format!("{err:#}").contains("timed out"), "err: {err:#}");
     }
@@ -514,7 +524,7 @@ if [ "$c" -eq 0 ]; then echo 'not json'; else echo '{"value":"fixed"}'; fi
     #[tokio::test]
     async fn test_extract_success() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let e = LlmExtractor::<Dummy>::from_bin(&fake_cli(&dir, "echo '{\"value\":\"ok\"}'"));
+        let e = pi_extractor::<Dummy>(fake_pi(&dir, "echo '{\"value\":\"ok\"}'"));
         let d = e.extract("text").await.expect("extract");
         assert_eq!(d.value, "ok");
     }
@@ -522,7 +532,7 @@ if [ "$c" -eq 0 ]; then echo 'not json'; else echo '{"value":"fixed"}'; fi
     #[tokio::test]
     async fn test_extract_strips_fences() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let e = LlmExtractor::<Dummy>::from_bin(&fake_cli(
+        let e = pi_extractor::<Dummy>(fake_pi(
             &dir,
             "printf '```json\n{\"value\":\"fenced\"}\n```\n'",
         ));
@@ -533,7 +543,7 @@ if [ "$c" -eq 0 ]; then echo 'not json'; else echo '{"value":"fixed"}'; fi
     #[tokio::test]
     async fn test_extract_repairs_once_and_succeeds() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let e = LlmExtractor::<Dummy>::from_bin(&fake_cli(&dir, FLAKY_SCRIPT));
+        let e = pi_extractor::<Dummy>(fake_pi(&dir, FLAKY_SCRIPT));
         let d = e.extract("text").await.expect("extract after repair");
         assert_eq!(d.value, "fixed");
         assert_eq!(call_count(&dir), 2, "exactly one retry");
@@ -542,7 +552,7 @@ if [ "$c" -eq 0 ]; then echo 'not json'; else echo '{"value":"fixed"}'; fi
     #[tokio::test]
     async fn test_extract_fails_after_one_retry() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let e = LlmExtractor::<Dummy>::from_bin(&fake_cli(&dir, "echo 'not json'"));
+        let e = pi_extractor::<Dummy>(fake_pi(&dir, "echo 'not json'"));
         let err = e.extract("text").await.expect_err("must fail");
         let msg = format!("{err:#}");
         assert!(msg.contains("after one retry"), "msg: {msg}");
@@ -552,7 +562,7 @@ if [ "$c" -eq 0 ]; then echo 'not json'; else echo '{"value":"fixed"}'; fi
     #[tokio::test]
     async fn test_extract_none_response_bails() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let e = LlmExtractor::<Dummy>::from_bin(&fake_cli(&dir, "echo NONE"));
+        let e = pi_extractor::<Dummy>(fake_pi(&dir, "echo NONE"));
         let err = e.extract("text").await.expect_err("must fail");
         assert!(format!("{err:#}").contains("empty or NONE"), "err: {err:#}");
     }
@@ -560,7 +570,7 @@ if [ "$c" -eq 0 ]; then echo 'not json'; else echo '{"value":"fixed"}'; fi
     #[tokio::test]
     async fn test_extract_cli_failure_bails() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let e = LlmExtractor::<Dummy>::from_bin(&fake_cli(&dir, "echo boom >&2; exit 1"));
+        let e = pi_extractor::<Dummy>(fake_pi(&dir, "echo boom >&2; exit 1"));
         let err = e.extract("text").await.expect_err("must fail");
         assert!(format!("{err:#}").contains("boom"), "err: {err:#}");
     }
@@ -568,10 +578,8 @@ if [ "$c" -eq 0 ]; then echo 'not json'; else echo '{"value":"fixed"}'; fi
     #[tokio::test]
     async fn test_shared_llm_extract_success() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let llm = SharedLlm::new(
-            fake_cli(&dir, "echo '{\"value\":\"ok\"}'"),
-            SharedLimits::default(),
-        );
+        let (b, a) = fake_pi(&dir, "echo '{\"value\":\"ok\"}'");
+        let llm = SharedLlm::new(b, a, SharedLimits::default());
         let d: Dummy = llm
             .extract("text", "ctx".to_owned())
             .await
@@ -582,10 +590,8 @@ if [ "$c" -eq 0 ]; then echo 'not json'; else echo '{"value":"fixed"}'; fi
     #[tokio::test]
     async fn test_shared_llm_verify_healthcheck() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let llm = SharedLlm::new(
-            fake_cli(&dir, "echo '{\"value\":\"ok\"}'"),
-            SharedLimits::default(),
-        );
+        let (b, a) = fake_pi(&dir, "echo '{\"value\":\"ok\"}'");
+        let llm = SharedLlm::new(b, a, SharedLimits::default());
         llm.verify::<Dummy>().await.expect("verify");
     }
 
@@ -611,8 +617,10 @@ echo $((c - 1)) > "$d/cur"
 rm -rf "$lock"
 echo '{"value":"ok"}'
 "#;
+        let (b, a) = fake_pi(&dir, script);
         let llm = SharedLlm::new(
-            fake_cli(&dir, script),
+            b,
+            a,
             SharedLimits {
                 max_concurrent_calls: 2,
                 ..SharedLimits::default()

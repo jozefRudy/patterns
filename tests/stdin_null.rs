@@ -7,7 +7,7 @@
 //!
 //! This test closes fd 0 in its own process (a tests/ binary — separate from
 //! the lib test process, so no other tests are affected) and runs one
-//! extraction against a fake CLI that drains stdin: `head -c 0` succeeds on
+//! extraction against a fake LLM CLI ("pi") that drains stdin: `head -c 0` succeeds on
 //! a readable-to-EOF stdin (/dev/null) and fails with EBADF on a closed one.
 
 use patterns::llm_cli::{Extractable, SharedLimits, SharedLlm};
@@ -53,9 +53,13 @@ async fn child_stdin_is_null_not_inherited_when_parent_fd0_closed() {
     let path = dir.path().join("fake.sh");
     // `head -c 0` drains stdin to EOF: /dev/null → exit 0, closed fd → EBADF
     std::fs::write(&path, "#!/bin/sh\nhead -c 0 && echo '{\"value\":\"ok\"}'\n").expect("write");
-    let bin = format!("sh {}", path.display());
-
-    let llm = SharedLlm::new(bin, SharedLimits::default());
+    // `sh script` stands in for the real LLM CLI (pi): any child works, the
+    // test asserts stdin behavior, not LLM behavior.
+    let llm = SharedLlm::new(
+        "sh".to_owned(),
+        vec![path.display().to_string()],
+        SharedLimits::default(),
+    );
     let d: Dummy = llm
         .extract::<Dummy>("text", String::new())
         .await

@@ -16,7 +16,7 @@ Modules (feature-gated; `default = ["llm_cli", "embed"]`):
 Usage (consumers pin exactly what they use — don't rely on defaults):
 
 ```toml
-patterns = { git = "https://github.com/jozefRudy/patterns", rev = "3676ea8", default-features = false, features = ["embed"] }
+patterns = { git = "https://github.com/jozefRudy/patterns", rev = "<sha>", default-features = false, features = ["embed"] }
 ```
 
 Deps with versions that matter are pinned exactly in this crate

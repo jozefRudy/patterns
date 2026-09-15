@@ -1,0 +1,3 @@
+[build]
+# ort's static ONNX runtime triggers benign arm64 alignment linker warnings
+rustflags = ["-A", "linker_messages"]

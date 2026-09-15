@@ -79,3 +79,8 @@ required-features = ["llm_cli"]
 [[test]]
 name = "define_prompts"
 required-features = ["llm_cli"]
+
+[profile.dev]
+# ort/ONNX statically linked into every test binary — full debug info makes
+# each rebuild churn GBs; line tables keep backtraces useful at a fraction of the size
+debug = "line-tables-only"

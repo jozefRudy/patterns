@@ -3,14 +3,61 @@
 Personal pattern library: reusable building blocks shared across my projects
 via a pinned git dependency. One crate, module per pattern.
 
-Modules:
-- `llm_cli` — structured extraction from text via a local LLM CLI, with
-  one-repair-retry semantics, via `SharedLlm`: a cloneable handle with a
-  process-wide concurrency cap. Prompt templating stays in consumers.
+Modules (feature-gated; `default = ["llm_cli", "embed"]`):
+- `llm_cli` (feature `llm_cli`) — structured extraction from text via a local
+  LLM CLI, with one-repair-retry semantics, via `SharedLlm`: a cloneable
+  handle with a process-wide concurrency cap. Prompt templating stays in
+  consumers.
+- `embed` (feature `embed`) — text embeddings via fastembed (ONNX, CPU,
+  in-process). Model, thread count and query/document prefixes configured at
+  load; query/document methods apply prefixes automatically.
 - `lance_store` — reserved.
 
-Usage:
-`patterns = { git = "https://github.com/jozefRudy/patterns", rev = "<sha>" }`
+Usage (consumers pin exactly what they use — don't rely on defaults):
+
+```toml
+patterns = { git = "https://github.com/jozefRudy/patterns", rev = "<sha>", default-features = false, features = ["embed"] }
+```
+
+Deps with versions that matter are pinned exactly in this crate
+(`fastembed =6.1.0`, `ort =2.0.0-rc.13` — which transitively pins a
+sha256-verified ONNX Runtime binary) and re-exported (`patterns::fastembed`,
+`patterns::ort`); consumers never declare them separately.
+
+## `embed` usage
+
+```rust
+use patterns::embed::{Embedder, LoadOptions, Prefixes};
+use patterns::fastembed::EmbeddingModel;
+
+// nomic-style model: query/document prefixes
+let nomic = LoadOptions::new(EmbeddingModel::NomicEmbedTextV15)
+    .with_prefixes(&Prefixes {
+        query: "search_query: ".into(),
+        document: "search_document: ".into(),
+    })
+    .with_intra_threads(4);          // leave cores for other tasks
+let embedder = Embedder::load(nomic, &cache_dir).await?;
+
+let v = embedder.embed_query("rust jobs").await?;   // prefix applied
+let vs = embedder.embed_batch_documents(&texts).await?; // doc prefix per text
+
+// symmetric model (BGE-M3): `LoadOptions::new(EmbeddingModel::BGEM3)` — no prefixes
+```
+
+Design:
+- prefixes are **model config**, passed at load; `embed_query`/
+  `embed_document`/`embed_batch_documents` apply them — no prefix logic at
+  call sites
+- inference runs on the blocking pool (`spawn_blocking`); the mutex is never
+  held across `.await`
+- `Embedder::fake(dim)` returns deterministic hash vectors — inject into
+  tests of embedding-adjacent logic (stores, ranking) without a model
+  download; `fake_with_prefixes` mirrors prefix behaviour
+- concurrency note: one shared handle serializes all callers (mutex). For
+  latency-sensitive serving alongside bulk embedding, load **two instances**
+  (query + bulk) so slow batches never queue behind user queries — the API
+  makes this a consumer decision, it's capacity policy, not machinery
 
 ## `llm_cli` usage
 

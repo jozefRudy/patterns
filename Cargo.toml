@@ -5,12 +5,19 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
-askama = "0.16"
-pastey = "0.2"
-schemars = "1"
+askama = { version = "0.16", optional = true }
+pastey = { version = "0.2", optional = true }
+schemars = { version = "1", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["process", "sync", "time"] }
+fastembed = { version = "=6.1.0", default-features = false, features = ["ort-download-binaries-native-tls", "hf-hub-native-tls"], optional = true }
+ort = { version = "=2.0.0-rc.13", optional = true }
+
+[features]
+default = ["llm_cli", "embed"]
+llm_cli = ["dep:askama", "dep:pastey", "dep:schemars"]
+embed = ["dep:fastembed", "dep:ort"]
 
 [dev-dependencies]
 libc = "0.2"
@@ -64,3 +71,11 @@ allow_attributes = "deny"
 allow_attributes_without_reason = "deny"
 
 # reference https://emschwartz.me/your-clippy-config-should-be-stricter/#my-configs
+
+[[test]]
+name = "stdin_null"
+required-features = ["llm_cli"]
+
+[[test]]
+name = "define_prompts"
+required-features = ["llm_cli"]

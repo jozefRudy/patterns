@@ -1,11 +1,23 @@
 //! Personal pattern library: reusable, strictly-linted building blocks
 //! shared across projects via a pinned git dependency.
 
+#[cfg(feature = "embed")]
+pub mod embed;
+#[cfg(feature = "llm_cli")]
 pub mod llm_cli;
 // Reserved: pub mod lance_store;
 
+/// Re-exported so embed consumers don't declare fastembed/ort separately
+/// (single version, enforced).
+#[cfg(feature = "embed")]
+pub use fastembed;
+#[cfg(feature = "embed")]
+pub use ort;
+
 /// Re-exported so `define_prompts!` consumers don't need own askama/paste deps.
+#[cfg(feature = "llm_cli")]
 pub use askama;
+#[cfg(feature = "llm_cli")]
 #[doc(hidden)]
 pub use pastey;
 
@@ -13,6 +25,7 @@ pub use pastey;
 ///
 /// Template paths resolve against the *consumer* crate's template dirs
 /// (its `askama.toml` / `templates/`).
+#[cfg(feature = "llm_cli")]
 #[macro_export]
 macro_rules! define_prompts {
     ($(($variant:ident, $path:literal)),* $(,)?) => {

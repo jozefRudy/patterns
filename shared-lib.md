@@ -102,6 +102,26 @@ Two real implementations to diff:
 3. Implement crate; migrate both projects; delete local copies; run
    validation in each.
 
+## Module 1b: `embed` — extracted NOW (two consumers)
+
+Extracted from `job_search/src/embed.rs`; reddit_v2 adopts with BGE-M3.
+
+In crate (`src/embed.rs`, behind `embed` feature flag — fastembed+ort are
+heavy, llm-only consumers skip them):
+
+- `Embedder` enum: `load(model, cache_dir)` (fastembed ONNX, CPU EP,
+  spawn_blocking) / `fake(dim)` / `dim()` / `embed` / `embed_batch`
+- fake hash-based embedding for tests + unit tests
+
+Stays in projects (domain):
+
+- model choice + model-id string used for dataset dir names
+- query/document prefixes — **caller always prepends** (empty string when the
+  model needs none, e.g. BGE-M3; `search_query:`/`search_document:` for nomic)
+
+Consumers declare `patterns = { ..., features = ["embed"] }`; crate re-exports
+`fastembed`/`ort` so consumers never pin them separately.
+
 ## Queued module: `search` — after reddit_v2 implements binary pipeline
 
 Both projects share the hybrid-search skeleton but with different legs:

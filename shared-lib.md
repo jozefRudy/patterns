@@ -109,15 +109,21 @@ Extracted from `job_search/src/embed.rs`; reddit_v2 adopts with BGE-M3.
 In crate (`src/embed.rs`, behind `embed` feature flag — fastembed+ort are
 heavy, llm-only consumers skip them):
 
-- `Embedder` enum: `load(model, cache_dir)` (fastembed ONNX, CPU EP,
-  spawn_blocking) / `fake(dim)` / `dim()` / `embed` / `embed_batch`
-- fake hash-based embedding for tests + unit tests
+- `Embedder` enum: `load(LoadOptions, cache_dir)` (fastembed ONNX, CPU EP,
+  spawn_blocking) / `fake(dim)` / `dim()` / `model_max_tokens`
+- documents are only embeddable chunked: `token_count`, `chunk`,
+  `embed_document_chunks`, `embed_batch_document_chunks` (tokenizer-exact,
+  boundary-aware, overlap, no tail loss); `embed_query` stays single-vector
+- `ChunkOptions` (max/overlap/min tokens) is caller config; texts below
+  `min_tokens` come back as an empty inner vec — caller owns skip policy
+- fake hash-based embedding + approximate tokenization for tests
 
 Stays in projects (domain):
 
 - model choice + model-id string used for dataset dir names
-- query/document prefixes — **caller always prepends** (empty string when the
-  model needs none, e.g. BGE-M3; `search_query:`/`search_document:` for nomic)
+- query/document prefixes passed as `Prefixes` at load (empty when the model
+  needs none, e.g. BGE-M3; `search_query:`/`search_document:` for nomic)
+- skip representation for below-`min_tokens` texts (status row, query filter)
 
 Consumers declare `patterns = { ..., features = ["embed"] }`; crate re-exports
 `fastembed`/`ort` so consumers never pin them separately.

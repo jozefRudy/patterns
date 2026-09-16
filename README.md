@@ -30,34 +30,59 @@ sha256-verified ONNX Runtime binary) and re-exported (`patterns::fastembed`,
 use patterns::embed::{Embedder, LoadOptions, Prefixes};
 use patterns::fastembed::EmbeddingModel;
 
-// nomic-style model: query/document prefixes
-let nomic = LoadOptions::new(EmbeddingModel::NomicEmbedTextV15)
-    .with_prefixes(&Prefixes {
-        query: "search_query: ".into(),
-        document: "search_document: ".into(),
-    })
-    .with_intra_threads(4);          // leave cores for other tasks
-let embedder = Embedder::load(nomic, &cache_dir).await?;
+// model + optional query/document prefixes (empty for symmetric models)
+let embedder = Embedder::load(
+    LoadOptions::new(EmbeddingModel::MxbaiEmbedLargeV1Q)
+        .with_prefixes(&Prefixes { query: "search_query: ".into(), document: "search_document: ".into() })
+        .with_intra_threads(4),      // leave cores for other tasks
+    &cache_dir,
+).await?;
 
-let v = embedder.embed_query("rust jobs").await?;   // prefix applied
-let vs = embedder.embed_batch_documents(&texts).await?; // doc prefix per text
+// queries: one vector, never chunked
+let q = embedder.embed_query("rust jobs").await?;
 
-// symmetric model (BGE-M3): `LoadOptions::new(EmbeddingModel::BGEM3)` — no prefixes
+// documents: always chunked — the only document API
+let opts = embedder.default_chunk_options();   // ctx − special tokens, 64 overlap, 5 min
+for c in embedder.embed_document_chunks(&long_post, &opts).await? {
+    // c.chunk.text / c.chunk.tokens / c.chunk.byte_start..byte_end / c.embedding
+}
+
+// batches: one model call across every document's chunks, flat row batch
+let rows = embedder.embed_batch_document_chunks(&texts, &opts).await?;
+for r in &rows {
+    // r.doc_ix -> ids[doc_ix]; r.chunk_ix; r.chunk.byte_start..byte_end; r.embedding
+}
+let seen: std::collections::HashSet<usize> = rows.iter().map(|r| r.doc_ix).collect();
+let skipped = (0..texts.len()).filter(|ix| !seen.contains(ix));  // below min_tokens
 ```
 
 Design:
-- prefixes are **model config**, passed at load; `embed_query`/
-  `embed_document`/`embed_batch_documents` apply them — no prefix logic at
-  call sites
+- **prefixes are model config**, applied by `embed_query` and the chunked
+  document methods — no prefix logic at call sites
+- **chunking is forced for documents**: tokenizer-exact, boundary-aware
+  (paragraph → sentence → whitespace), with overlap and a no-tail-loss
+  guarantee. Long-tail text is chunked, never silently truncated
+- **`opts` is explicit** (transparent, per-call-site overridable);
+  `default_chunk_options()` derives from the model's context window,
+  `ChunkOptions::new(max_tokens)` is the manual escape hatch. Below
+  `min_tokens` a document contributes no rows — the caller owns whether that
+  becomes a status row, a query filter, or nothing
+- **row batch**: `EmbeddedChunk { doc_ix, chunk_ix, chunk, embedding }`, ordered
+  by `(doc_ix, chunk_ix)`; `doc_ix` is the index into the slice you passed, so
+  ids stay positional and skipped documents are `(0..texts.len()) − seen`
+- **inspection before embedding**: `token_count(text)` (full count, truncation
+  off) and `model_max_tokens()` for callers that gate or size things themselves
+- **storage helpers**: `packed_len`, `binarize` (1 bit/dim, LSB-first,
+  hamming-ready) and `quantize_u8` (8 bits/dim). One packing contract shared by
+  index build and query — see
+  https://emschwartz.me/binary-vector-embeddings-are-so-cool/ (binary vectors:
+  32× smaller, ~25× faster lookups, ~96% of float retrieval quality)
 - inference runs on the blocking pool (`spawn_blocking`); the mutex is never
-  held across `.await`
-- `Embedder::fake(dim)` returns deterministic hash vectors — inject into
-  tests of embedding-adjacent logic (stores, ranking) without a model
-  download; `fake_with_prefixes` mirrors prefix behaviour
-- concurrency note: one shared handle serializes all callers (mutex). For
+  held across `.await`. One handle serializes its callers — for
   latency-sensitive serving alongside bulk embedding, load **two instances**
-  (query + bulk) so slow batches never queue behind user queries — the API
-  makes this a consumer decision, it's capacity policy, not machinery
+  (query + bulk). That's capacity policy, so it stays a consumer decision
+- `Embedder::fake(dim)` returns deterministic hash vectors for tests of
+  embedding-adjacent logic (stores, ranking) without a model download
 
 ## `llm_cli` usage
 

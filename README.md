@@ -41,14 +41,10 @@ let embedder = Embedder::load(
 // queries: one vector, never chunked
 let q = embedder.embed_query("rust jobs").await?;
 
-// documents: always chunked — the only document API
+// documents: always chunked — the only document API, one call per batch
 let opts = embedder.default_chunk_options();   // ctx − special tokens, 64 overlap, 5 min
-for c in embedder.embed_document_chunks(&long_post, &opts).await? {
-    // c.chunk.text / c.chunk.tokens / c.chunk.byte_start..byte_end / c.embedding
-}
-
-// batches: one model call across every document's chunks, flat row batch
 let rows = embedder.embed_batch_document_chunks(&texts, &opts).await?;
+// single document: embed_batch_document_chunks(&[text], &opts)  (doc_ix == 0)
 for r in &rows {
     // r.doc_ix -> ids[doc_ix]; r.chunk_ix; r.chunk.byte_start..byte_end; r.embedding
 }

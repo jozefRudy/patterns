@@ -279,17 +279,8 @@ impl Embedder {
         Ok(self.token_spans(text)?.len())
     }
 
-    /// Embed one document, chunked (`doc_ix` is always 0 here).
-    pub async fn embed_document_chunks(
-        &self,
-        text: &str,
-        opts: &ChunkOptions,
-    ) -> Result<Vec<EmbeddedChunk>> {
-        self.embed_batch_document_chunks(std::slice::from_ref(&text.to_string()), opts)
-            .await
-    }
-
-    /// Embed documents, chunked, returning a flat row batch.
+    /// Embed documents, chunked, returning a flat row batch. Pass a
+    /// single-element slice for one document (`doc_ix` is then 0).
     ///
     /// Each [`EmbeddedChunk`] carries its `doc_ix` (index into `texts`) and
     /// `chunk_ix`, so callers can write rows or regroup without relying on
@@ -780,7 +771,7 @@ mod tests {
             min_tokens: 1,
         };
         let chunks = e
-            .embed_document_chunks("aa bb cc dd ee", &opts)
+            .embed_batch_document_chunks(&["aa bb cc dd ee".to_string()], &opts)
             .await
             .expect("chunks");
         assert!(chunks.len() > 1);
@@ -911,7 +902,7 @@ mod tests {
         assert!(e.token_count(&long).expect("count") > 2_000);
         // embedding the same text must still work (model tokenizer still truncates)
         let chunks = e
-            .embed_document_chunks(&long, &e.default_chunk_options())
+            .embed_batch_document_chunks(&[long.clone()], &e.default_chunk_options())
             .await
             .expect("embed long text");
         assert!(!chunks.is_empty());

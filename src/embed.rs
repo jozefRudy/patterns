@@ -280,21 +280,24 @@ impl Embedder {
     }
 
     /// Embed documents, chunked, returning a flat row batch. Pass a
-    /// single-element slice for one document (`doc_ix` is then 0).
+    /// single-element slice for one document (`doc_ix` is then 0). Accepts any
+    /// `AsRef<str>` elements (`&[&str]`, `&[String]`, …) so callers don't have to
+    /// own the text.
     ///
     /// Each [`EmbeddedChunk`] carries its `doc_ix` (index into `texts`) and
     /// `chunk_ix`, so callers can write rows or regroup without relying on
     /// position; rows are ordered by `(doc_ix, chunk_ix)`. Documents below
     /// `opts.min_tokens` contribute no chunks — the caller derives its skip set
     /// from the `doc_ix` values that appear.
-    pub async fn embed_batch_document_chunks(
+    pub async fn embed_batch_document_chunks<S: AsRef<str> + Sync>(
         &self,
-        texts: &[String],
+        texts: &[S],
         opts: &ChunkOptions,
     ) -> Result<Vec<EmbeddedChunk>> {
         // chunk per document, then ONE batched model call across all of them
         let mut pending: Vec<(usize, usize, TextChunk)> = Vec::new();
         for (doc_ix, text) in texts.iter().enumerate() {
+            let text = text.as_ref();
             if self.token_count(text)? < opts.min_tokens {
                 continue;
             }
@@ -771,7 +774,7 @@ mod tests {
             min_tokens: 1,
         };
         let chunks = e
-            .embed_batch_document_chunks(&["aa bb cc dd ee".to_string()], &opts)
+            .embed_batch_document_chunks(&["aa bb cc dd ee"], &opts)
             .await
             .expect("chunks");
         assert!(chunks.len() > 1);
@@ -902,7 +905,7 @@ mod tests {
         assert!(e.token_count(&long).expect("count") > 2_000);
         // embedding the same text must still work (model tokenizer still truncates)
         let chunks = e
-            .embed_batch_document_chunks(&[long.clone()], &e.default_chunk_options())
+            .embed_batch_document_chunks(std::slice::from_ref(&long), &e.default_chunk_options())
             .await
             .expect("embed long text");
         assert!(!chunks.is_empty());

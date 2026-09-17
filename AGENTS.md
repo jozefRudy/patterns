@@ -25,6 +25,7 @@ cargo test -- --include-ignored
 Prefer functional style where idiomatic:
 
 - take by value, return results — avoid `&mut` out-params
+- read-only params borrow, never force a caller copy: `&T`/`&[T]`, or a generic (`S: AsRef<str>`) when callers hold varying types — not owned `String`/`Vec<T>`; `ptr_arg` misses this class, so clippy won't flag it
 - mutation confined inside functions; immutable data across boundaries
   (accumulate into a local struct like `RefillOut`, return it)
 - pure leaf fns get `const` (`cargo clippy --fix` adds it)

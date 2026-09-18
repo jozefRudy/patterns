@@ -12,8 +12,10 @@ Modules (feature-gated; `default = ["llm_cli", "embed", "language"]`):
   in-process). Model, thread count and query/document prefixes configured at
   load; query/document methods apply prefixes automatically.
 - `language` (feature `language`) — English text detection via lingua.
-  Process-wide singleton detector (`OnceLock<Arc<...>>`, no locks — read-only
-  after build), `detect(&str)` off the blocking pool.
+  Process-wide singleton detector (`OnceLock<Arc<...>>` — memory optimization:
+  preloaded language models load exactly once, shared by all instances; no
+  locks since the detector is immutable after build), `detect(&str)` off the
+  blocking pool.
 - `lance_store` — reserved.
 
 Usage (consumers pin exactly what they use — don't rely on defaults):

@@ -103,12 +103,11 @@ results of full 75-language mode; models preloaded.
 Minimum text: single meaningful words already work ("the", "programming" →
 English; "Bonjour", "Cześć" → not), typos don't derail detection, but a
 sentence or more is the reliable zone — below ~2-3 words treat the result as
-weak (job-filter callers can afford this: real ads are paragraphs).
+weak.
 
 Languages verified in tests (correctly NOT detected as English): Polish,
 Spanish, French, German, Italian, Dutch, Swedish, Russian, Japanese, Korean,
-Hindi, Thai, Arabic, Hebrew, Turkish, Zulu — including job-ad-length Polish
-text and 2-letter internet slang ("TIL", "AITA", "hi").
+Hindi, Thai, Arabic, Hebrew, Turkish, Zulu.
 
 ## `llm_cli` usage
 

@@ -3,6 +3,8 @@
 
 #[cfg(feature = "embed")]
 pub mod embed;
+#[cfg(feature = "language")]
+pub mod language;
 #[cfg(feature = "llm_cli")]
 pub mod llm_cli;
 // Reserved: pub mod lance_store;

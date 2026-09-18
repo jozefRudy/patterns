@@ -140,6 +140,10 @@ enum Inner {
         model: Arc<Mutex<TextEmbedding>>,
         dim: usize,
         prefixes: Prefixes,
+        /// Truncation-disabled copy for counting: `token_count` reads it
+        /// immutably (`Tokenizer::encode` takes `&self`) — no lock, so counting
+        /// never contends with inference on the model mutex.
+        count_tokenizer: Arc<tokenizers::Tokenizer>,
     },
 }
 
@@ -168,10 +172,18 @@ impl Embedder {
         })
         .await??;
 
+        // counting copy: truncation disabled once, then frozen behind an Arc —
+        // encode() is &self, so counts are full-length and lock-free forever
+        let mut count_tokenizer = embedder.tokenizer.clone();
+        count_tokenizer
+            .with_truncation(None)
+            .map_err(|e| anyhow::anyhow!("disable truncation: {e}"))?;
+
         Ok(Self(Inner::FastEmbed {
             model: Arc::new(Mutex::new(embedder)),
             dim,
             prefixes,
+            count_tokenizer: Arc::new(count_tokenizer),
         }))
     }
 
@@ -273,10 +285,23 @@ impl Embedder {
 
     /// Full-text token count (truncation disabled).
     ///
+    /// Lock-free: reads the dedicated counting tokenizer, never the model
+    /// mutex — safe to call at high frequency alongside inference.
+    ///
     /// Fake embedders approximate (whitespace words) — don't assert exact
     /// counts against them.
     pub fn token_count(&self, text: &str) -> Result<usize> {
-        Ok(self.token_spans(text)?.len())
+        match &self.0 {
+            Inner::Fake { .. } => Ok(fake_token_spans(text).len()),
+            Inner::FastEmbed {
+                count_tokenizer, ..
+            } => {
+                let encoding = count_tokenizer
+                    .encode(text, false)
+                    .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
+                Ok(encoding.get_ids().len())
+            }
+        }
     }
 
     /// Embed documents, chunked, returning a flat row batch. Pass a
@@ -881,6 +906,29 @@ mod tests {
     async fn load_returns_expected_dim() {
         let e = test_embedder().await;
         assert_eq!(e.dim(), 384);
+    }
+
+    #[tokio::test]
+    #[ignore = "downloads model"]
+    async fn token_count_counts_every_word_and_empty_input() {
+        let e = test_embedder().await;
+        assert_eq!(
+            e.token_count("").expect("count"),
+            0,
+            "empty text has no tokens"
+        );
+        let text = "hello world foo bar baz qux";
+        let n = e.token_count(text).expect("count");
+        let words = text.split_whitespace().count();
+        assert!(
+            n >= words,
+            "every English word is at least one token (count {n} < {words} words)"
+        );
+        assert_eq!(
+            e.token_count(text).expect("count"),
+            n,
+            "counting is deterministic"
+        );
     }
 
     #[tokio::test]

@@ -12,12 +12,16 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["process", "sync", "time"] }
 fastembed = { version = "=6.1.0", default-features = false, features = ["ort-download-binaries-native-tls", "hf-hub-native-tls"], optional = true }
+lingua = { version = "1.8.0", default-features = false, features = ["english", "french", "german", "spanish", "polish"], optional = true }
+# count-only tokenizer access (lock-free) — version pinned to fastembed's
+tokenizers = { version = "0.23", default-features = false, optional = true }
 ort = { version = "=2.0.0-rc.13", optional = true }
 
 [features]
-default = ["llm_cli", "embed"]
+default = ["llm_cli", "embed", "language"]
 llm_cli = ["dep:askama", "dep:pastey", "dep:schemars"]
-embed = ["dep:fastembed", "dep:ort"]
+embed = ["dep:fastembed", "dep:ort", "dep:tokenizers"]
+language = ["dep:lingua"]
 
 [dev-dependencies]
 libc = "0.2"

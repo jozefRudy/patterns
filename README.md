@@ -3,7 +3,7 @@
 Personal pattern library: reusable building blocks shared across my projects
 via a pinned git dependency. One crate, module per pattern.
 
-Modules (feature-gated; `default = ["llm_cli", "embed"]`):
+Modules (feature-gated; `default = ["llm_cli", "embed", "language"]`):
 - `llm_cli` (feature `llm_cli`) — structured extraction from text via a local
   LLM CLI, with one-repair-retry semantics, via `SharedLlm`: a cloneable
   handle with a process-wide concurrency cap. Prompt templating stays in
@@ -11,6 +11,9 @@ Modules (feature-gated; `default = ["llm_cli", "embed"]`):
 - `embed` (feature `embed`) — text embeddings via fastembed (ONNX, CPU,
   in-process). Model, thread count and query/document prefixes configured at
   load; query/document methods apply prefixes automatically.
+- `language` (feature `language`) — English text detection via lingua.
+  Process-wide singleton detector (`OnceLock<Arc<...>>`, no locks — read-only
+  after build), `detect(&str)` off the blocking pool.
 - `lance_store` — reserved.
 
 Usage (consumers pin exactly what they use — don't rely on defaults):
@@ -79,6 +82,33 @@ Design:
   (query + bulk). That's capacity policy, so it stays a consumer decision
 - `Embedder::fake(dim)` returns deterministic hash vectors for tests of
   embedding-adjacent logic (stores, ranking) without a model download
+
+## `language` usage
+
+```rust
+use patterns::language::LanguageService;
+
+let svc = LanguageService::new();   // all instances share one singleton detector
+let is_english: anyhow::Result<bool> = svc.detect("Senior Rust developer, remote").await;
+```
+
+English with confidence > 0.5 counts as English. Examples that detect as
+English: "the", "programming", "I love programming", long advert sentences
+("Machine learning is a subset of artificial intelligence..."), and typos
+don't derail it ("I love programing", "artificail inteligence"). Candidate languages are
+narrowed to five (en, fr, de, es, pl) — a small, distinctive set keeps
+detection confident on almost any input while avoiding the false-English
+results of full 75-language mode; models preloaded.
+
+Minimum text: single meaningful words already work ("the", "programming" →
+English; "Bonjour", "Cześć" → not), typos don't derail detection, but a
+sentence or more is the reliable zone — below ~2-3 words treat the result as
+weak (job-filter callers can afford this: real ads are paragraphs).
+
+Languages verified in tests (correctly NOT detected as English): Polish,
+Spanish, French, German, Italian, Dutch, Swedish, Russian, Japanese, Korean,
+Hindi, Thai, Arabic, Hebrew, Turkish, Zulu — including job-ad-length Polish
+text and 2-letter internet slang ("TIL", "AITA", "hi").
 
 ## `llm_cli` usage
 

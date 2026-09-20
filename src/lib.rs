@@ -16,6 +16,19 @@ pub use fastembed;
 #[cfg(feature = "embed")]
 pub use ort;
 
+// Guard: the ONNX Runtime C API level `ort` asks for is the *union* of every
+// crate's `api-*` features — the highest one wins, and features can only be
+// added, never subtracted. This crate links the system onnxruntime (via
+// `ORT_LIB_LOCATION`) instead of ort's bundled one, so a silent bump past its
+// supported API version only fails at *runtime* (`GetApi` returns null ->
+// panic). Assert the known-good level here so any dependency bump fails the
+// build instead.
+#[cfg(feature = "embed")]
+const _: () = assert!(
+    ort::sys::ORT_API_VERSION == 24,
+    "ort API level changed: re-check the linked onnxruntime version (deploy pins 1.26, which supports API <= 26)"
+);
+
 /// Re-exported so `define_prompts!` consumers don't need own askama/paste deps.
 #[cfg(feature = "llm_cli")]
 pub use askama;

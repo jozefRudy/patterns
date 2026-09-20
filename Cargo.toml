@@ -15,7 +15,7 @@ fastembed = { version = "=6.1.0", default-features = false, features = ["ort-dow
 lingua = { version = "1.8.0", default-features = false, features = ["english", "french", "german", "spanish", "polish"], optional = true }
 # count-only tokenizer access (lock-free) — version pinned to fastembed's
 tokenizers = { version = "0.23", default-features = false, optional = true }
-ort = { version = "=2.0.0-rc.13", optional = true }
+ort = { version = "=2.0.0-rc.13", optional = true, default-features = false }
 
 [features]
 default = ["llm_cli", "embed", "language"]

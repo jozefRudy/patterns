@@ -59,7 +59,9 @@ pub type QuestionMap = BTreeMap<String, Question>;
 /// A typed question set: a domain struct whose fields are both the question ids
 /// and the deserialized answers.
 ///
-/// Implement by hand, or generate with [`crate::define_questions!`].
+/// Prefer [`crate::define_questions!`], which generates this impl (including
+/// `render_state` from an askama template). Implement by hand only when the
+/// state is not template-rendered.
 pub trait Questions {
     /// The struct the response `answers` object deserializes into.
     type Answers: for<'de> Deserialize<'de>;
@@ -69,18 +71,16 @@ pub trait Questions {
 
     /// Render the shared state from input `text` and dynamic `prompt_context`.
     ///
-    /// Defaults to plain concatenation; [`crate::define_questions!`] overrides
-    /// it with the askama template declared alongside the questions.
-    fn render_state(text: &str, prompt_context: &str) -> Result<String> {
-        Ok(format!("{text}\n\n{prompt_context}"))
-    }
+    /// [`crate::define_questions!`] implements it from the askama template
+    /// declared alongside the questions.
+    fn render_state(text: &str, prompt_context: &str) -> Result<String>;
 }
 
 /// Define a [`Questions`] set.
 ///
 /// One `struct` whose fields are both the question ids and the typed answers,
-/// plus the `Questions` impl building the map and an inherent `render_state`
-/// rendering the input from an askama template.
+/// plus the `Questions` impl building the map and implementing `render_state`
+/// against an askama template.
 ///
 /// The template path resolves against the *consumer* crate's template dirs
 /// (its `askama.toml` / `templates/`); it receives `{{ text }}` and

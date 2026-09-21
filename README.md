@@ -338,8 +338,8 @@ Answers map straight onto the response `answers` object, keyed by id:
   probability-weighted position, `argmax_level()` the highest-probability
   level index. The wire `score`/`legend` are derived and not stored.
 
-Unknown response fields (`model`, `usage`, `legend`, a choice's
-`probabilities`) are ignored; on parse failure the raw `answers` JSON is
+Unknown response fields (`model`, `usage`, `legend`, and `score`'s derived
+`score` value) are ignored; on parse failure the raw `answers` JSON is
 included in the error context.
 
 ### Healthcheck as a batch gate

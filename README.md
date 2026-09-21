@@ -3,7 +3,7 @@
 Personal pattern library: reusable building blocks shared across my projects
 via a pinned git dependency. One crate, module per pattern.
 
-Modules (feature-gated; `default = ["llm_cli", "embed", "language"]`):
+Modules (feature-gated; `default = ["llm_cli", "embed", "language", "systemone"]`):
 - `llm_cli` (feature `llm_cli`) — structured extraction from text via a local
   LLM CLI, with one-repair-retry semantics, via `SharedLlm`: a cloneable
   handle with a process-wide concurrency cap. Prompt templating stays in
@@ -16,6 +16,12 @@ Modules (feature-gated; `default = ["llm_cli", "embed", "language"]`):
   preloaded language models load exactly once, shared by all instances; no
   locks since the detector is immutable after build), `detect(&str)` off the
   blocking pool.
+- `systemone` (feature `systemone`) — bounded HTTP client for the TypeSafe
+  SystemOne (Jev) protocol (`POST {base_url}/v1/systemone`), via
+  `SharedSystemOne`: a cloneable handle with a process-wide concurrency cap and
+  a per-call timeout, no retries. Base URL/API key/model come from the caller
+  (never read from env); backends differ only by base URL. Questions are
+  independent; define an `Evaluatable` impl for the batch healthcheck.
 - `lance_store` — reserved.
 
 Usage (consumers pin exactly what they use — don't rely on defaults):
@@ -121,14 +127,19 @@ cap only works if all callers share one handle. Limits are app policy, passed
 at construction (env var reading stays in the consumer):
 
 ```rust
+use patterns::limits::ConcurrencyLimits;
+
 let llm = SharedLlm::new(
-    "pi --print --no-session --no-tools --no-extensions --mode text --thinking off --model deepseek/deepseek-v4-flash".into(),
-    SharedLimits {
-        max_concurrent_calls: 2,
-        max_text_len: 4000,
-        call_timeout: Duration::from_secs(30),
-    },
-);
+    "pi".into(),
+    vec![
+        "--print".into(), "--no-session".into(), "--no-tools".into(),
+        "--no-extensions".into(), "--mode".into(), "text".into(),
+        "--thinking".into(), "off".into(),
+        "--model".into(), "deepseek/deepseek-v4-flash".into(),
+    ],
+    ConcurrencyLimits::default(),       // max_concurrent_calls + call_timeout
+)
+.with_max_text_len(4000);                // llm-local, defaults to 4000
 ```
 
 Consumer defines three things:
@@ -236,5 +247,122 @@ for item in items {
 A failing healthcheck is a loud tripwire *before* a batch burns — a broken
 pipeline otherwise surfaces as silent parse failures (or worse, silently
 wrong rows) across every item in the run.
+
+## `systemone` usage
+
+One bounded HTTP client for the TypeSafe SystemOne (Jev) protocol
+(`POST {base_url}/v1/systemone`). Backends differ only by base URL — direct
+(`https://api.typesafe.ai`) or OpenRouter (`https://openrouter.ai/api`); the
+path is fixed internally. Entry point is `SharedSystemOne`: a cloneable handle
+holding the base URL, API key, model and `ConcurrencyLimits`, with a
+process-wide concurrency cap and a per-call timeout. **No retries** (mirrors
+the TypeSafe SDK). The caller supplies base URL/API key/model — the client
+never reads the environment.
+
+Same shape as `llm_cli`: the consumer owns the domain, the questions and the
+validation. The difference is the transport — instead of a prompt template and
+a CLI, SystemOne takes a `state` plus a typed question set and returns one
+answer per question id. `define_questions!` builds the typed questions *and*
+renders the shared input from a consumer-owned `.md` template (same askama
+machinery as `define_prompts!`, without the extraction schema) — both declared
+in one place, so the template and the questions can't drift apart.
+
+The consumer defines a typed question set (with its input template) and its
+validation:
+
+```rust
+use patterns::limits::ConcurrencyLimits;
+use patterns::systemone::{SharedSystemOne, Questions};
+
+let client = SharedSystemOne::new(
+    "https://api.typesafe.ai".into(),
+    api_key,
+    "jev-latest".into(),
+    ConcurrencyLimits::default(),
+);
+
+// 1. domain: the struct + `Questions` impl + `render_state`, all from one
+//    declaration. The template path resolves at compile time (askama).
+patterns::define_questions! {
+    JobAssessment: "job_input.md" {
+        is_remote:   noul("Is the role fully remote, with no onsite or region restriction? Judge only from the job posting in the input."),
+        seniority:   choice(
+            "Which seniority level does the posting target?",
+            [
+                ("junior", "0-2 years, mentored work"),
+                ("mid", "3-5 years, works independently"),
+                ("senior", "6+ years, leads work and reviews others"),
+                ("staff", "org-wide technical leadership"),
+                ("unknown", "not stated or genuinely ambiguous"),
+            ],
+        ),
+        match_score: score(
+            "How strong is the match for a senior Rust/backend engineer?",
+            ["Poor", "Weak", "Fair", "Strong", "Excellent"],
+        ),
+        red_flags:   noul("Does the posting contain a red flag (unpaid trial, vague comp, 'rockstar/ninja' culture)?"),
+    }
+}
+
+// 2. evaluate: `evaluate_text` renders the state from the template declared
+//    above (`{{ text }}` + `{{ prompt_context }}`) and sends it. Use
+//    `evaluate` directly to pass an already-built state.
+let assessment = client.evaluate_text::<JobAssessment>(&posting_text, &context).await?;
+// assessment.is_remote.noul       -> P(remote), e.g. 0.94
+// assessment.seniority.choice     -> "senior", .confidence
+// assessment.match_score.expected() -> 3.4; .argmax_level() -> 4
+// assessment.red_flags.noul       -> P(red flag)
+```
+
+`job_input.md` (resolved against your own `askama.toml` dirs):
+
+```md
+Job posting:
+{{ text }}
+
+Additional context:
+{{ prompt_context }}
+```
+
+Questions are **independent and evaluated in parallel** — none sees another's
+answer, so don't chain them. Each question carries free-form `instructions`
+(any `serde_json::Value`: string, object or array) plus structured `criteria`
+(options/levels) — criteria go over the wire as data, not baked into the
+instructions text.
+
+Answers map straight onto the response `answers` object, keyed by id:
+- `noul` → `Noul { noul }` (probability of yes)
+- `choice` → `Choice { choice, confidence, probabilities }` (argmax +
+  confidence — **not** `P(option)`)
+- `score` → `Score { confidence, probabilities }`; `expected()` gives the
+  probability-weighted position, `argmax_level()` the highest-probability
+  level index. The wire `score`/`legend` are derived and not stored.
+
+Unknown response fields (`model`, `usage`, `legend`, a choice's
+`probabilities`) are ignored; on parse failure the raw `answers` JSON is
+included in the error context.
+
+### Healthcheck as a batch gate
+
+Same pattern as `SharedLlm::verify::<T>()`: implement `Evaluatable` with a
+fixture text and validation; the gate renders that text through the **real**
+template and reuses the **real** questions, then call it **once per batch,
+before the pass** (never per item):
+
+```rust
+impl patterns::systemone::Evaluatable for JobAssessment {
+    const HEALTHCHECK_TEXT: &'static str = "Senior Rust dev, fully remote, EUR 80k-100k";
+
+    // semantic smoke test on the known fixture — proves the model understands
+    // the task, not just that it emits parseable JSON
+    fn verify(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.is_remote.noul > 0.5, "remote not detected");
+        anyhow::ensure!(self.seniority.choice == "senior", "wrong seniority");
+        Ok(())
+    }
+}
+
+client.verify::<JobAssessment>().await?;   // skip the batch on failure
+```
 
 License: MIT.

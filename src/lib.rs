@@ -10,11 +10,14 @@ pub use serde;
 
 #[cfg(feature = "embed")]
 pub mod embed;
+#[cfg(feature = "embed_api")]
+pub mod embed_api;
 #[cfg(feature = "language")]
 pub mod language;
 pub mod limits;
 #[cfg(feature = "llm_cli")]
 pub mod llm_cli;
+pub mod retry;
 #[cfg(feature = "systemone")]
 pub mod systemone;
 // Reserved: pub mod lance_store;

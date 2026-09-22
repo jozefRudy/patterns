@@ -5,7 +5,7 @@ via a pinned git dependency. One consumer-facing crate, module per pattern;
 an internal `patterns-macros` proc-macro crate provides the `#[derive(Extractable)]`
 and `#[derive(SystemOne)]` derives (consumers still depend on `patterns` alone).
 
-Modules (feature-gated; `default = ["llm_cli", "embed", "language", "systemone"]`):
+Modules (feature-gated; `default = ["llm_cli", "embed", "embed_api", "language", "systemone"]`):
 - `llm_cli` (feature `llm_cli`) — structured extraction from text via a local
   LLM CLI, with one-repair-retry semantics, via `SharedLlm`: a cloneable
   handle with a process-wide concurrency cap. The domain is one annotated
@@ -21,11 +21,17 @@ Modules (feature-gated; `default = ["llm_cli", "embed", "language", "systemone"]
   blocking pool.
 - `systemone` (feature `systemone`) — bounded HTTP client for the TypeSafe
   SystemOne (Jev) protocol (`POST {base_url}/v1/systemone`), via
-  `SharedSystemOne`: a cloneable handle with a process-wide concurrency cap and
-  a per-call timeout, no retries. Base URL/API key/model come from the caller
+  `SharedSystemOne`: a cloneable handle with a process-wide concurrency cap, a
+  per-call timeout and a configurable `RetryPolicy` (default 3 attempts,
+  250ms→2s) for transient failures. Base URL/API key/model come from the caller
   (never read from env); backends differ only by base URL. Questions are
   independent; `#[derive(SystemOne)]` generates the typed question set and,
   with `healthcheck = "…"`, the batch-gate `Evaluatable` impl.
+- `embed_api` (feature `embed_api`) — bounded HTTP client for any
+  OpenAI-compatible `/embeddings` endpoint (DeepInfra, OpenAI, Together,
+  SiliconFlow), via `EmbeddingApi`: a cloneable handle with a process-wide
+  concurrency cap, batching and retry. Base URL/API key/model/dims come from
+  the caller (never read from env).
 - `lance_store` — reserved.
 
 Usage (consumers pin exactly what they use — don't rely on defaults):
@@ -96,6 +102,44 @@ Design:
   (query + bulk). That's capacity policy, so it stays a consumer decision
 - `Embedder::fake(dim)` returns deterministic hash vectors for tests of
   embedding-adjacent logic (stores, ranking) without a model download
+
+
+## `embed_api` usage
+
+Call any OpenAI-compatible `/embeddings` endpoint. The caller owns config
+(base URL, key, model, dims) — nothing is read from the environment.
+
+```rust
+use patterns::embed_api::EmbeddingApi;
+use patterns::limits::ConcurrencyLimits;
+
+let api = EmbeddingApi::new(
+    "https://api.deepinfra.com/v1/openai",
+    api_key,
+    "Qwen/Qwen3-Embedding-8B",
+    Some(512),                    // MRL truncation; None = model native dims
+    ConcurrencyLimits::default(), // process-wide concurrency cap + per-call timeout
+)?
+.with_service_tier("flex")          // optional; omitted when unset
+.with_max_batch_size(512);         // optional; default 256
+
+let vectors = api.embed(&["first text", "second text"]).await?;
+```
+
+Notes:
+- `dims = None` omits the `dimensions` field (non-MRL models / native output);
+  `dims = Some(n)` requires `n >= 32` and requests MRL truncation. Truncated
+  vectors are **not** renormalized — normalize downstream if you need unit length.
+- Inputs are split into batches and issued with bounded concurrency; results
+  come back in input order. Retries cover 429/5xx/timeouts; other 4xx fail fast.
+- `.with_tokenizer(source)` enables `token_count(text).await` for local gating
+  (e.g. skip texts too short to embed). `source` is an HF repo id (only
+  `tokenizer.json` is fetched; requires `.with_hf_home(path)` — cache
+  `{path}/hub`, token file `{path}/token`) or a local `tokenizer.json` path
+  (no `hf_home` needed). The client never reads `HF_HOME` from the environment.
+  Lazy-loaded once and shared across clones; without it `token_count` errors.
+- Only the OpenAI-compatible schema is supported (DeepInfra, OpenAI, Together,
+  SiliconFlow). Native Cohere/Voyage/Jina APIs are out of scope.
 
 ## `language` usage
 
@@ -258,8 +302,10 @@ One bounded HTTP client for the TypeSafe SystemOne (Jev) protocol
 (`https://api.typesafe.ai`) or OpenRouter (`https://openrouter.ai/api`); the
 path is fixed internally. Entry point is `SharedSystemOne`: a cloneable handle
 holding the base URL, API key, model and `ConcurrencyLimits`, with a
-process-wide concurrency cap and a per-call timeout. **No retries** (mirrors
-the TypeSafe SDK). The caller supplies base URL/API key/model — the client
+process-wide concurrency cap and a per-call timeout. Transient failures
+(429/5xx, timeouts, transport errors) are retried per a configurable
+`RetryPolicy` (default 3 attempts, 250ms exponential backoff capped at 2s).
+The caller supplies base URL/API key/model — the client
 never reads the environment.
 
 Same shape as `llm_cli`: the consumer owns the domain, the questions and the

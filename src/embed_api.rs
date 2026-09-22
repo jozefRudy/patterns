@@ -11,6 +11,7 @@
 //! output (`n >= 32`). Truncated vectors are not renormalized.
 
 use crate::limits::ConcurrencyLimits;
+use crate::retry::{HttpResponse, RetryPolicy};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -18,18 +19,10 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
 use tokenizers::Tokenizer;
 use tokio::sync::{OnceCell, Semaphore};
 use tokio::task::JoinSet;
-use tokio::time::timeout;
 
-/// Retry attempts per batch (including the first try).
-const MAX_ATTEMPTS: usize = 3;
-/// First retry delay; doubles per attempt, capped at [`MAX_BACKOFF`].
-const BASE_BACKOFF: Duration = Duration::from_millis(250);
-/// Upper bound on retry delay.
-const MAX_BACKOFF: Duration = Duration::from_secs(2);
 /// Default inputs per request.
 const DEFAULT_MAX_BATCH_SIZE: usize = 256;
 /// Smallest MRL output dimension accepted by OpenAI-compatible providers.
@@ -58,13 +51,6 @@ struct EmbeddingItem {
 }
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
-
-/// Raw HTTP outcome; non-2xx statuses are returned, not errored, so the caller
-/// can classify transient vs payload failures.
-struct HttpResponse {
-    status: u16,
-    body: String,
-}
 
 /// HTTP seam; injectable so tests run fully offline.
 trait Transport: Send + Sync + 'static {
@@ -127,6 +113,7 @@ pub struct EmbeddingApi {
     tokenizer_source: Option<String>,
     hf_home: Option<PathBuf>,
     tokenizer: Arc<OnceCell<Tokenizer>>,
+    retry: RetryPolicy,
     permits: Arc<Semaphore>,
     transport: Arc<dyn Transport>,
 }
@@ -143,6 +130,7 @@ impl fmt::Debug for EmbeddingApi {
             .field("limits", &self.config.limits)
             .field("tokenizer_source", &self.tokenizer_source)
             .field("hf_home", &self.hf_home)
+            .field("retry", &self.retry)
             .finish_non_exhaustive()
     }
 }
@@ -224,6 +212,13 @@ impl EmbeddingApi {
         self
     }
 
+    /// Set the transient-failure retry policy (default 3 attempts, 250ms→2s).
+    #[must_use]
+    pub const fn with_retry_policy(mut self, retry: RetryPolicy) -> Self {
+        self.retry = retry;
+        self
+    }
+
     /// Test seam: build with an injected transport and explicit config.
     fn with_transport(transport: Arc<dyn Transport>, config: ApiConfig) -> Self {
         let permits = Arc::new(Semaphore::new(config.limits.max_concurrent_calls));
@@ -232,6 +227,7 @@ impl EmbeddingApi {
             tokenizer_source: None,
             hf_home: None,
             tokenizer: Arc::new(OnceCell::new()),
+            retry: RetryPolicy::default(),
             permits,
             transport,
         }
@@ -280,43 +276,18 @@ impl EmbeddingApi {
         let url = format!("{}/embeddings", self.config.base_url);
         let body = serde_json::to_vec(&self.build_body(inputs))
             .context("serialize embeddings request body")?;
-        let mut attempt = 0usize;
-        loop {
-            attempt += 1;
-            match timeout(
-                self.config.limits.call_timeout,
-                self.transport.post(&url, &self.config.api_key, &body),
-            )
-            .await
-            {
-                Ok(Ok(response)) if (200..300).contains(&response.status) => {
-                    return parse_response(&response.body, inputs.len());
+        let response = self
+            .retry
+            .run("embeddings", self.config.limits.call_timeout, {
+                move || {
+                    let transport = Arc::clone(&self.transport);
+                    let url = url.clone();
+                    let body = body.clone();
+                    async move { transport.post(&url, &self.config.api_key, &body).await }
                 }
-                Ok(Ok(response)) if is_transient(response.status) => {
-                    if attempt >= MAX_ATTEMPTS {
-                        anyhow::bail!(
-                            "embeddings HTTP {} after {attempt} attempts: {}",
-                            response.status,
-                            response.body
-                        );
-                    }
-                }
-                Ok(Ok(response)) => {
-                    anyhow::bail!("embeddings HTTP {}: {}", response.status, response.body);
-                }
-                Ok(Err(error)) => {
-                    if attempt >= MAX_ATTEMPTS {
-                        return Err(error.context("embeddings transport failed"));
-                    }
-                }
-                Err(_elapsed) => {
-                    if attempt >= MAX_ATTEMPTS {
-                        anyhow::bail!("embeddings call timed out after {attempt} attempts");
-                    }
-                }
-            }
-            tokio::time::sleep(backoff(attempt)).await;
-        }
+            })
+            .await?;
+        parse_response(&response.body, inputs.len())
     }
 
     /// Assemble the request body for a batch.
@@ -386,18 +357,6 @@ fn load_hf_tokenizer(repo: &str, hf_home: Option<&Path>) -> Result<Tokenizer> {
         .map_err(|e| anyhow::anyhow!("download tokenizer.json for {repo}: {e}"))?;
     Tokenizer::from_file(&path)
         .map_err(|e| anyhow::anyhow!("load tokenizer from {}: {e}", path.display()))
-}
-
-/// Retryable statuses: rate limit and server errors.
-fn is_transient(status: u16) -> bool {
-    status == 429 || (500..600).contains(&status)
-}
-
-/// Exponential backoff for the given 1-based attempt, capped at [`MAX_BACKOFF`].
-fn backoff(attempt: usize) -> Duration {
-    let shift = attempt.saturating_sub(1).min(31);
-    let factor = 1u32 << shift;
-    BASE_BACKOFF.saturating_mul(factor).min(MAX_BACKOFF)
 }
 
 /// Parse a 2xx body, ordering vectors by `index` and validating the batch shape.

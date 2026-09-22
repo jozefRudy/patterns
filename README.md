@@ -21,8 +21,9 @@ Modules (feature-gated; `default = ["llm_cli", "embed", "embed_api", "language",
   blocking pool.
 - `systemone` (feature `systemone`) — bounded HTTP client for the TypeSafe
   SystemOne (Jev) protocol (`POST {base_url}/v1/systemone`), via
-  `SharedSystemOne`: a cloneable handle with a process-wide concurrency cap and
-  a per-call timeout, no retries. Base URL/API key/model come from the caller
+  `SharedSystemOne`: a cloneable handle with a process-wide concurrency cap, a
+  per-call timeout and a configurable `RetryPolicy` (default 3 attempts,
+  250ms→2s) for transient failures. Base URL/API key/model come from the caller
   (never read from env); backends differ only by base URL. Questions are
   independent; `#[derive(SystemOne)]` generates the typed question set and,
   with `healthcheck = "…"`, the batch-gate `Evaluatable` impl.
@@ -301,8 +302,10 @@ One bounded HTTP client for the TypeSafe SystemOne (Jev) protocol
 (`https://api.typesafe.ai`) or OpenRouter (`https://openrouter.ai/api`); the
 path is fixed internally. Entry point is `SharedSystemOne`: a cloneable handle
 holding the base URL, API key, model and `ConcurrencyLimits`, with a
-process-wide concurrency cap and a per-call timeout. **No retries** (mirrors
-the TypeSafe SDK). The caller supplies base URL/API key/model — the client
+process-wide concurrency cap and a per-call timeout. Transient failures
+(429/5xx, timeouts, transport errors) are retried per a configurable
+`RetryPolicy` (default 3 attempts, 250ms exponential backoff capped at 2s).
+The caller supplies base URL/API key/model — the client
 never reads the environment.
 
 Same shape as `llm_cli`: the consumer owns the domain, the questions and the

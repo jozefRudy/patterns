@@ -11,6 +11,7 @@
 //! additionally derives an expected position from them.
 
 use crate::limits::ConcurrencyLimits;
+use crate::retry::{HttpResponse, RetryPolicy};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -20,7 +21,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
-use tokio::time::timeout;
 
 /// One typed question evaluated against the request state.
 ///
@@ -179,7 +179,7 @@ trait Transport: Send + Sync + 'static {
         url: &'a str,
         api_key: &'a str,
         body: &'a [u8],
-    ) -> BoxFuture<'a, Result<String>>;
+    ) -> BoxFuture<'a, Result<HttpResponse>>;
 }
 
 struct HttpTransport {
@@ -192,7 +192,7 @@ impl Transport for HttpTransport {
         url: &'a str,
         api_key: &'a str,
         body: &'a [u8],
-    ) -> BoxFuture<'a, Result<String>> {
+    ) -> BoxFuture<'a, Result<HttpResponse>> {
         Box::pin(async move {
             let response = self
                 .client
@@ -203,15 +203,12 @@ impl Transport for HttpTransport {
                 .send()
                 .await
                 .context("systemone request failed")?;
-            let status = response.status();
-            let text = response
+            let status = response.status().as_u16();
+            let body = response
                 .text()
                 .await
                 .context("read systemone response body")?;
-            if !status.is_success() {
-                anyhow::bail!("systemone returned HTTP {status}: {text}");
-            }
-            Ok(text)
+            Ok(HttpResponse { status, body })
         })
     }
 }
@@ -250,6 +247,7 @@ pub struct SharedSystemOne {
     api_key: String,
     model: String,
     limits: ConcurrencyLimits,
+    retry: RetryPolicy,
     permits: Arc<Semaphore>,
     transport: Arc<dyn Transport>,
 }
@@ -261,6 +259,7 @@ impl fmt::Debug for SharedSystemOne {
             .field("api_key", &"<redacted>")
             .field("model", &self.model)
             .field("limits", &self.limits)
+            .field("retry", &self.retry)
             .finish_non_exhaustive()
     }
 }
@@ -302,17 +301,26 @@ impl SharedSystemOne {
             base_url,
             api_key,
             model,
+            retry: RetryPolicy::default(),
             permits: Arc::new(Semaphore::new(limits.max_concurrent_calls)),
             limits,
             transport,
         }
     }
 
+    /// Set the transient-failure retry policy (default 3 attempts, 250ms→2s).
+    #[must_use]
+    pub const fn with_retry_policy(mut self, retry: RetryPolicy) -> Self {
+        self.retry = retry;
+        self
+    }
+
     /// Evaluate a typed question set against `state`, returning its `Answers`.
     ///
     /// `state` is anything serializable: a rendered input string, a typed
-    /// struct, or a `json!({...})` object. One bounded request (no retries)
-    /// under the process-wide concurrency cap. On parse failure the raw
+    /// struct, or a `json!({...})` object. One bounded request, retried per the
+    /// configured [`RetryPolicy`] (429/5xx/timeouts/transport) under the
+    /// process-wide concurrency cap. On parse failure the raw
     /// `answers` JSON is included in the error context.
     pub async fn evaluate<Q: Questions>(&self, state: impl Serialize) -> Result<Q::Answers> {
         let state = serde_json::to_value(state).context("serialize systemone state")?;
@@ -350,13 +358,18 @@ impl SharedSystemOne {
             questions,
         })
         .context("serialize systemone request body")?;
-        let text = timeout(
-            self.limits.call_timeout,
-            self.transport.post(&url, &self.api_key, &body),
-        )
-        .await
-        .context("systemone call timed out")?
-        .context("systemone transport failed")?;
+        let response = self
+            .retry
+            .run("systemone", self.limits.call_timeout, {
+                move || {
+                    let transport = Arc::clone(&self.transport);
+                    let url = url.clone();
+                    let body = body.clone();
+                    async move { transport.post(&url, &self.api_key, &body).await }
+                }
+            })
+            .await?;
+        let text = response.body;
         let response: RawResponse = serde_json::from_str(&text)
             .with_context(|| format!("parse systemone response envelope: {text}"))?;
         let answers = response.answers;
@@ -396,25 +409,40 @@ mod tests {
     }
 
     struct FakeTransport {
-        responses: Mutex<VecDeque<Result<String>>>,
+        responses: Mutex<VecDeque<Result<HttpResponse>>>,
         requests: Mutex<Vec<Recorded>>,
+    }
+
+    fn ok_response(body: String) -> HttpResponse {
+        HttpResponse { status: 200, body }
+    }
+
+    fn status_response(status: u16, body: &str) -> HttpResponse {
+        HttpResponse {
+            status,
+            body: body.to_owned(),
+        }
     }
 
     impl FakeTransport {
         fn new(responses: Vec<String>) -> Arc<Self> {
+            Self::from_responses(
+                responses
+                    .into_iter()
+                    .map(|body| Ok(ok_response(body)))
+                    .collect(),
+            )
+        }
+
+        fn from_responses(responses: Vec<Result<HttpResponse>>) -> Arc<Self> {
             Arc::new(Self {
-                responses: Mutex::new(responses.into_iter().map(Ok).collect()),
+                responses: Mutex::new(responses.into_iter().collect()),
                 requests: Mutex::new(Vec::new()),
             })
         }
 
         fn failing(message: &str) -> Arc<Self> {
-            Arc::new(Self {
-                responses: Mutex::new(VecDeque::from([Err(anyhow::Error::msg(
-                    message.to_owned(),
-                ))])),
-                requests: Mutex::new(Vec::new()),
-            })
+            Self::from_responses(vec![Err(anyhow::Error::msg(message.to_owned()))])
         }
 
         fn last_request(&self) -> Recorded {
@@ -437,7 +465,7 @@ mod tests {
             url: &'a str,
             api_key: &'a str,
             body: &'a [u8],
-        ) -> BoxFuture<'a, Result<String>> {
+        ) -> BoxFuture<'a, Result<HttpResponse>> {
             self.requests.lock().expect("lock requests").push(Recorded {
                 url: url.to_owned(),
                 api_key: api_key.to_owned(),
@@ -463,11 +491,14 @@ mod tests {
             _url: &'a str,
             _api_key: &'a str,
             _body: &'a [u8],
-        ) -> BoxFuture<'a, Result<String>> {
+        ) -> BoxFuture<'a, Result<HttpResponse>> {
             let delay = self.delay;
             Box::pin(async move {
                 tokio::time::sleep(delay).await;
-                Ok(String::new())
+                Ok(HttpResponse {
+                    status: 200,
+                    body: String::new(),
+                })
             })
         }
     }
@@ -505,14 +536,17 @@ mod tests {
             _url: &'a str,
             _api_key: &'a str,
             _body: &'a [u8],
-        ) -> BoxFuture<'a, Result<String>> {
+        ) -> BoxFuture<'a, Result<HttpResponse>> {
             let inner = self.inner.clone();
             Box::pin(async move {
                 let now = inner.active.fetch_add(1, Ordering::SeqCst) + 1;
                 inner.max.fetch_max(now, Ordering::SeqCst);
                 tokio::time::sleep(inner.delay).await;
                 inner.active.fetch_sub(1, Ordering::SeqCst);
-                Ok(r#"{"answers":{"urgency":{"type":"noul","noul":0.5}}}"#.to_owned())
+                Ok(HttpResponse {
+                    status: 200,
+                    body: r#"{"answers":{"urgency":{"type":"noul","noul":0.5}}}"#.to_owned(),
+                })
             })
         }
     }
@@ -750,7 +784,7 @@ mod tests {
     #[tokio::test]
     async fn evaluate_propagates_transport_error() {
         let transport = FakeTransport::failing("connection reset");
-        let handle = client(transport);
+        let handle = client(transport).with_retry_policy(RetryPolicy::none());
         let error = handle
             .evaluate::<NoulOut>(&json!({}))
             .await
@@ -759,6 +793,34 @@ mod tests {
             format!("{error:#}").contains("connection reset"),
             "error: {error:#}"
         );
+    }
+
+    #[tokio::test]
+    async fn retries_transient_then_succeeds() {
+        let transport = FakeTransport::from_responses(vec![
+            Ok(status_response(503, "busy")),
+            Ok(ok_response(NOUL_RESPONSE.to_owned())),
+        ]);
+        let handle = client(transport.clone());
+        let out: NoulOut = handle
+            .evaluate::<NoulOut>(&json!({}))
+            .await
+            .expect("evaluate");
+        assert!((out.urgency.noul - 0.7).abs() < 1e-6);
+        assert_eq!(transport.call_count(), 2, "one retry after 503");
+    }
+
+    #[tokio::test]
+    async fn fails_fast_on_payload_status() {
+        let transport =
+            FakeTransport::from_responses(vec![Ok(status_response(400, "bad request"))]);
+        let handle = client(transport.clone());
+        let error = handle
+            .evaluate::<NoulOut>(&json!({}))
+            .await
+            .expect_err("must fail");
+        assert_eq!(transport.call_count(), 1, "no retry on 4xx");
+        assert!(format!("{error:#}").contains("400"), "error: {error:#}");
     }
 
     #[tokio::test]

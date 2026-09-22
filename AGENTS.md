@@ -11,13 +11,13 @@
 Don't relax clippy rules -> #[allow(clippy::*)]
 After completing code changes, run validation:
 ```bash
-cargo build && cargo clippy --all-targets && cargo test && cargo fmt
+cargo build --workspace && cargo clippy --workspace --all-targets && cargo test --workspace && cargo fmt --all
 ```
 
 Integration tests, run after changes related to api clients
 
 ```bash
-cargo test -- --include-ignored
+cargo test --workspace -- --include-ignored
 ```
 
 ## Style: functional core
@@ -42,3 +42,18 @@ Prefer functional style where idiomatic:
 ## Documentation
 
 - Check `md_docs/` when using unfamiliar APIs, 3rd party crates, or trait/method signature errors. Note: `md_docs/` is auto-generated and gitignored — don't edit it.
+
+## Extraction rules
+
+How patterns get into this crate, and how modules are shaped:
+
+1. **Context-free patterns**: one consumer suffices if the API is stable.
+2. **Context-coupled patterns**: wait for a second real consumer; extract from
+   the diff between the implementations, not from one.
+3. **One module per pattern.** Split into additional crates only on evidence
+   (heavy/conflicting deps, or a required proc-macro crate — e.g. the internal
+   `patterns-macros`). Never a catch-all `utils` module.
+4. **Public repo + git deps with rev pins.** Publish to crates.io only once
+   APIs stabilize and external use matters.
+5. **Constraints travel with the crate README** (invariant panics,
+   message-passing ownership, no locks across `.await`).

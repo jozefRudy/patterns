@@ -1,0 +1,31 @@
+[package]
+name = "patterns-macros"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["derive"] }
+
+[lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+missing_errors_doc = "allow"
+needless_borrow = "deny"
+
+# DENY PANICS (proc-macro parsing must return syn::Error, never panic)
+unwrap_used = "deny"
+string_slice = "deny"
+indexing_slicing = "deny"
+as_conversions = "deny"
+panic = "deny"
+exit = "deny"
+unwrap_in_result = "deny"
+
+# enforce AGENTS.md "no #[allow(clippy::*)]" mechanically
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"

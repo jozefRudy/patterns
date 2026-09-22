@@ -59,9 +59,10 @@ pub type QuestionMap = BTreeMap<String, Question>;
 /// A typed question set: a domain struct whose fields are both the question ids
 /// and the deserialized answers.
 ///
-/// Prefer [`crate::define_questions!`], which generates this impl (including
-/// `render_state` from an askama template). Implement by hand only when the
-/// state is not template-rendered.
+/// Prefer `#[derive(SystemOne)]` (re-exported at the crate root), which
+/// generates this impl (including `render_state` from an askama template)
+/// from the field annotations. Implement by hand only when the state is not
+/// template-rendered.
 pub trait Questions {
     /// The struct the response `answers` object deserializes into.
     type Answers: for<'de> Deserialize<'de>;
@@ -71,116 +72,9 @@ pub trait Questions {
 
     /// Render the shared state from input `text` and dynamic `prompt_context`.
     ///
-    /// [`crate::define_questions!`] implements it from the askama template
-    /// declared alongside the questions.
+    /// The derive implements it from the askama template declared in
+    /// `#[systemone(template = "...")]`.
     fn render_state(text: &str, prompt_context: &str) -> Result<String>;
-}
-
-/// Define a [`Questions`] set.
-///
-/// One `struct` whose fields are both the question ids and the typed answers,
-/// plus the `Questions` impl building the map and implementing `render_state`
-/// against an askama template.
-///
-/// The template path resolves against the *consumer* crate's template dirs
-/// (its `askama.toml` / `templates/`); it receives `{{ text }}` and
-/// `{{ prompt_context }}`.
-///
-/// ```ignore
-/// define_questions! {
-///     JobFit: "job_fit_input.md" {
-///         relevant:  noul("Is this role a good fit?"),
-///         seniority: score("Seniority match?", ["junior", "senior"]),
-///         role:      choice("Primary role?", ["trading", ("other", "none of these")]),
-///     }
-/// }
-/// ```
-#[macro_export]
-macro_rules! define_questions {
-    ($Name:ident : $path:literal { $($field:ident : $kind:ident ( $($args:tt)* )),* $(,)? }) => {
-        #[derive($crate::serde::Deserialize, ::std::fmt::Debug)]
-        pub struct $Name {
-            $( pub $field: $crate::__systemone_answer_type!($kind), )*
-        }
-
-        $crate::pastey::paste! {
-            #[derive($crate::askama::Template)]
-            #[template(path = $path, ext = "md", askama = $crate::askama)]
-            struct [<$Name Input>]<'a> {
-                text: &'a str,
-                prompt_context: &'a str,
-            }
-        }
-
-        impl $crate::systemone::Questions for $Name {
-            type Answers = $Name;
-
-            /// Render the `SystemOne` `state` from input `text` and dynamic
-            /// `prompt_context` using the template declared with the questions.
-            fn render_state(text: &str, prompt_context: &str) -> ::anyhow::Result<String> {
-                use $crate::askama::Template;
-                $crate::pastey::paste! {
-                    [<$Name Input>] { text, prompt_context }
-                }
-                .render()
-                .map_err(::std::convert::Into::into)
-            }
-
-            fn questions() -> $crate::systemone::QuestionMap {
-                ::std::iter::IntoIterator::into_iter([
-                    $(
-                        (
-                            ::std::string::String::from(::std::stringify!($field)),
-                            $crate::__systemone_question!($kind ( $($args)* )),
-                        )
-                    ),*
-                ])
-                .collect()
-            }
-        }
-    };
-}
-
-#[doc(hidden)]
-#[macro_export]
-macro_rules! __systemone_answer_type {
-    (noul) => {
-        $crate::systemone::Noul
-    };
-    (score) => {
-        $crate::systemone::Score
-    };
-    (choice) => {
-        $crate::systemone::Choice
-    };
-}
-
-#[doc(hidden)]
-#[macro_export]
-macro_rules! __systemone_question {
-    (noul($instructions:expr)) => {
-        $crate::systemone::noul($instructions)
-    };
-    (score($instructions:expr, [ $($level:expr),* $(,)? ])) => {
-        $crate::systemone::score($instructions, [ $($level),* ])
-    };
-    (choice($instructions:expr, [ $($entry:tt),* $(,)? ])) => {
-        $crate::systemone::choice(
-            $instructions,
-            [ $( $crate::__systemone_choice_entry!($entry) ),* ],
-        )
-    };
-}
-
-#[doc(hidden)]
-#[macro_export]
-macro_rules! __systemone_choice_entry {
-    (($label:expr, $description:expr)) => {
-        ($label, ::std::option::Option::Some($description))
-    };
-    ($label:expr) => {
-        ($label, ::std::option::Option::<&str>::None)
-    };
 }
 
 /// A yes/no question without criteria descriptions.
@@ -487,6 +381,7 @@ impl SharedSystemOne {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SystemOne;
     use serde_json::json;
     use std::collections::VecDeque;
     use std::sync::Mutex;
@@ -622,23 +517,14 @@ mod tests {
         }
     }
 
-    define_questions! {
-        NoulOut: "test_input.md" {
-            urgency: noul("Is it urgent?"),
-        }
+    #[derive(SystemOne, Debug, serde::Deserialize)]
+    #[systemone(template = "test_input.md", healthcheck = "Healthcheck text.")]
+    pub struct NoulOut {
+        #[noul("Is it urgent?")]
+        pub urgency: Noul,
     }
 
-    define_questions! {
-        Mixed: "test_input.md" {
-            is_urgent: noul("Urgent?"),
-            severity:  score("Severity?", ["low", "high"]),
-            team:      choice("Team?", ["billing", ("other", "none of these")]),
-        }
-    }
-
-    impl Evaluatable for NoulOut {
-        const HEALTHCHECK_TEXT: &'static str = "Healthcheck text.";
-
+    impl NoulOut {
         fn verify(&self) -> Result<()> {
             anyhow::ensure!(
                 (0.0..=1.0).contains(&self.urgency.noul),
@@ -647,6 +533,17 @@ mod tests {
             );
             Ok(())
         }
+    }
+
+    #[derive(SystemOne, Debug, serde::Deserialize)]
+    #[systemone(template = "test_input.md")]
+    pub struct Mixed {
+        #[noul("Urgent?")]
+        is_urgent: Noul,
+        #[score("Severity?", "low", "high")]
+        severity: Score,
+        #[choice("Team?", billing, other = "none of these")]
+        team: Choice,
     }
 
     fn client(transport: Arc<dyn Transport>) -> SharedSystemOne {
@@ -776,7 +673,7 @@ mod tests {
     }
 
     #[test]
-    fn define_questions_builds_typed_map_and_answers() {
+    fn derive_builds_typed_map_and_answers() {
         let questions = <Mixed as Questions>::questions();
         assert_eq!(
             serde_json::to_value(&questions).expect("serialize questions"),
@@ -800,7 +697,7 @@ mod tests {
     }
 
     #[test]
-    fn define_questions_render_state_uses_template() {
+    fn derive_render_state_uses_template() {
         let noul = NoulOut::render_state("N-TEXT", "N-CTX").expect("render noul state");
         assert!(noul.contains("Input: N-TEXT"));
         assert!(noul.contains("Context: N-CTX"));

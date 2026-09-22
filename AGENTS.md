@@ -11,13 +11,13 @@
 Don't relax clippy rules -> #[allow(clippy::*)]
 After completing code changes, run validation:
 ```bash
-cargo build && cargo clippy --all-targets && cargo test && cargo fmt
+cargo build --workspace && cargo clippy --workspace --all-targets && cargo test --workspace && cargo fmt --all
 ```
 
 Integration tests, run after changes related to api clients
 
 ```bash
-cargo test -- --include-ignored
+cargo test --workspace -- --include-ignored
 ```
 
 ## Style: functional core

@@ -1,12 +1,18 @@
 //! Personal pattern library: reusable, strictly-linted building blocks
 //! shared across projects via a pinned git dependency.
 
+/// Re-exported so macro-generated derives resolve without a direct `serde` dep.
+pub use serde;
+
 #[cfg(feature = "embed")]
 pub mod embed;
 #[cfg(feature = "language")]
 pub mod language;
+pub mod limits;
 #[cfg(feature = "llm_cli")]
 pub mod llm_cli;
+#[cfg(feature = "systemone")]
+pub mod systemone;
 // Reserved: pub mod lance_store;
 
 /// Re-exported so embed consumers don't declare fastembed/ort separately
@@ -29,10 +35,11 @@ const _: () = assert!(
     "ort API level changed: re-check the linked onnxruntime version (deploy pins 1.26, which supports API <= 26)"
 );
 
-/// Re-exported so `define_prompts!` consumers don't need own askama/paste deps.
-#[cfg(feature = "llm_cli")]
+/// Re-exported so `define_prompts!`/`define_questions!` consumers don't need
+/// own askama/paste deps.
+#[cfg(any(feature = "llm_cli", feature = "systemone"))]
 pub use askama;
-#[cfg(feature = "llm_cli")]
+#[cfg(any(feature = "llm_cli", feature = "systemone"))]
 #[doc(hidden)]
 pub use pastey;
 

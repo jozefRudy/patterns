@@ -10,7 +10,7 @@
 //! extraction against a fake LLM CLI ("pi") that drains stdin: `head -c 0` succeeds on
 //! a readable-to-EOF stdin (/dev/null) and fails with EBADF on a closed one.
 
-use patterns::llm_cli::{Extractable, SharedLimits, SharedLlm};
+use patterns::llm_cli::{ConcurrencyLimits, Extractable, SharedLlm};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -58,7 +58,7 @@ async fn child_stdin_is_null_not_inherited_when_parent_fd0_closed() {
     let llm = SharedLlm::new(
         "sh".to_owned(),
         vec![path.display().to_string()],
-        SharedLimits::default(),
+        ConcurrencyLimits::default(),
     );
     let d: Dummy = llm
         .extract::<Dummy>("text", String::new())

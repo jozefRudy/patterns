@@ -17,14 +17,10 @@ use tokio::process::Command;
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
-/// Default per-call timeout for the LLM CLI.
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+pub use crate::limits::{ConcurrencyLimits, DEFAULT_MAX_CONCURRENT_CALLS, DEFAULT_TIMEOUT};
 
 /// Default maximum byte length of text embedded into prompts.
 pub const DEFAULT_MAX_TEXT_LEN: usize = 4000;
-
-/// Default cap on concurrent LLM CLI calls across a process.
-pub const DEFAULT_MAX_CONCURRENT_CALLS: usize = 2;
 
 /// A type that can be extracted from LLM output.
 ///
@@ -187,30 +183,6 @@ impl<T: Extractable> LlmExtractor<T> {
     }
 }
 
-/// Limits for a [`SharedLlm`] gateway.
-///
-/// App-specific policy (e.g. pi cold start, long wiki pages) is passed in by
-/// the consumer; see `DEFAULT_*` constants for the generic defaults.
-#[derive(Debug, Clone)]
-pub struct SharedLimits {
-    /// Cap on concurrent LLM CLI calls across all holders of the handle.
-    pub max_concurrent_calls: usize,
-    /// Max bytes of task text embedded into a prompt.
-    pub max_text_len: usize,
-    /// Per-call subprocess timeout.
-    pub call_timeout: Duration,
-}
-
-impl Default for SharedLimits {
-    fn default() -> Self {
-        Self {
-            max_concurrent_calls: DEFAULT_MAX_CONCURRENT_CALLS,
-            max_text_len: DEFAULT_MAX_TEXT_LEN,
-            call_timeout: DEFAULT_TIMEOUT,
-        }
-    }
-}
-
 /// Shared, cloneable LLM handle with bounded concurrency.
 ///
 /// Single access point for all LLM-backed tasks in a process: owns the CLI
@@ -222,28 +194,40 @@ impl Default for SharedLimits {
 pub struct SharedLlm {
     bin: String,
     args: Vec<String>,
-    limits: SharedLimits,
+    max_text_len: usize,
+    limits: ConcurrencyLimits,
     permits: Arc<Semaphore>,
 }
 
 impl SharedLlm {
-    /// Build from a bin path, pre-split args, and limits (breaking: old
+    /// Build from a bin path, pre-split args, and concurrency limits (breaking: old
     /// single-command-string ctor removed; `job_search` stays on pinned rev).
+    /// Prompt text is capped at [`DEFAULT_MAX_TEXT_LEN`]; override with
+    /// [`with_max_text_len`](Self::with_max_text_len).
     #[must_use]
-    pub fn new(bin: String, args: Vec<String>, limits: SharedLimits) -> Self {
+    pub fn new(bin: String, args: Vec<String>, limits: ConcurrencyLimits) -> Self {
         Self {
             bin,
             args,
+            max_text_len: DEFAULT_MAX_TEXT_LEN,
             permits: Arc::new(Semaphore::new(limits.max_concurrent_calls)),
             limits,
         }
+    }
+
+    /// Override the maximum byte length of text embedded into prompts
+    /// (default: [`DEFAULT_MAX_TEXT_LEN`]).
+    #[must_use]
+    pub const fn with_max_text_len(mut self, max_text_len: usize) -> Self {
+        self.max_text_len = max_text_len;
+        self
     }
 
     /// One bounded extraction of `T` from `text`.
     ///
     /// Waits for a semaphore permit (process-wide concurrency cap), then runs
     /// the subprocess via the internal extractor (one repair retry, limits from
-    /// [`SharedLimits`]). `context` is rendered into the caller's prompt
+    /// [`ConcurrencyLimits`]). `context` is rendered into the caller's prompt
     /// template.
     ///
     /// # Errors
@@ -256,7 +240,7 @@ impl SharedLlm {
             .context("LLM semaphore closed")?;
         LlmExtractor::<T>::from_parts(self.bin.clone(), self.args.clone())
             .with_prompt_context(context)
-            .with_max_text_len(self.limits.max_text_len)
+            .with_max_text_len(self.max_text_len)
             .with_timeout(self.limits.call_timeout)
             .extract(text)
             .await
@@ -579,7 +563,7 @@ if [ "$c" -eq 0 ]; then echo 'not json'; else echo '{"value":"fixed"}'; fi
     async fn test_shared_llm_extract_success() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (b, a) = fake_pi(&dir, "echo '{\"value\":\"ok\"}'");
-        let llm = SharedLlm::new(b, a, SharedLimits::default());
+        let llm = SharedLlm::new(b, a, ConcurrencyLimits::default());
         let d: Dummy = llm
             .extract("text", "ctx".to_owned())
             .await
@@ -591,7 +575,7 @@ if [ "$c" -eq 0 ]; then echo 'not json'; else echo '{"value":"fixed"}'; fi
     async fn test_shared_llm_verify_healthcheck() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (b, a) = fake_pi(&dir, "echo '{\"value\":\"ok\"}'");
-        let llm = SharedLlm::new(b, a, SharedLimits::default());
+        let llm = SharedLlm::new(b, a, ConcurrencyLimits::default());
         llm.verify::<Dummy>().await.expect("verify");
     }
 
@@ -621,9 +605,9 @@ echo '{"value":"ok"}'
         let llm = SharedLlm::new(
             b,
             a,
-            SharedLimits {
+            ConcurrencyLimits {
                 max_concurrent_calls: 2,
-                ..SharedLimits::default()
+                ..ConcurrencyLimits::default()
             },
         );
         futures(llm.clone(), 8).await;

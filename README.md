@@ -126,7 +126,7 @@ let api = EmbeddingApi::new(
     ConcurrencyLimits::default(), // process-wide concurrency cap + per-call timeout
 )?
 .with_prefixes(&prefixes)           // optional; model config, shared with `embed`
-.with_max_tokens(32_768)            // model context window (from the card); for chunking
+.with_max_tokens(32_768)            // model ctx window — from the card (see Notes); for chunking
 .with_tokenizer("Qwen/Qwen3-Embedding-8B")  // for chunking + `token_count`
 .with_hf_home(cache_dir)            // required when `with_tokenizer` is an HF repo id
 .with_service_tier("flex")          // optional; omitted when unset
@@ -152,7 +152,8 @@ Notes:
   chunks across the batch in one call. Same document-always-chunked rule as the
   in-process `embed` backend.
 - `.with_max_tokens(n)` declares the model's context window (read it from the
-  model card — `config.json`/`tokenizer_config.json` fields like
+  model card: https://huggingface.co/Qwen/Qwen3-Embedding-8B → "Context Length:
+  32k" — `config.json`/`tokenizer_config.json` fields like
   `max_position_embeddings`/`model_max_length` can exceed the real window).
   `.default_chunk_options()` derives `ChunkOptions` from it and errors until set.
 - `.with_tokenizer(source)` enables `token_count(text).await` and is required by

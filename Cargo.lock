@@ -1698,7 +1698,7 @@ dependencies = [
  "libc",
  "lingua",
  "ort",
- "pastey",
+ "patterns-macros",
  "reqwest 0.13.5",
  "schemars",
  "serde",
@@ -1706,6 +1706,15 @@ dependencies = [
  "tempfile",
  "tokenizers",
  "tokio",
+]
+
+[[package]]
+name = "patterns-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

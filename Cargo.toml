@@ -1,3 +1,7 @@
+[workspace]
+members = ["macros"]
+resolver = "3"
+
 [package]
 name = "patterns"
 version = "0.1.0"
@@ -7,7 +11,7 @@ edition = "2024"
 anyhow = "1"
 reqwest = { version = "0.13", features = ["json"], optional = true }
 askama = { version = "0.16", optional = true }
-pastey = { version = "0.2", optional = true }
+patterns-macros = { path = "macros", optional = true }
 schemars = { version = "1", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -20,10 +24,12 @@ ort = { version = "=2.0.0-rc.13", optional = true, default-features = false }
 
 [features]
 default = ["llm_cli", "embed", "language", "systemone"]
-llm_cli = ["dep:askama", "dep:pastey", "dep:schemars"]
+templating = ["dep:askama"]
+derives = ["dep:patterns-macros"]
+llm_cli = ["templating", "derives", "dep:schemars"]
 embed = ["dep:fastembed", "dep:ort", "dep:tokenizers"]
 language = ["dep:lingua"]
-systemone = ["dep:reqwest", "dep:askama", "dep:pastey"]
+systemone = ["templating", "derives", "dep:reqwest"]
 
 [dev-dependencies]
 libc = "0.2"
@@ -83,8 +89,12 @@ name = "stdin_null"
 required-features = ["llm_cli"]
 
 [[test]]
-name = "define_prompts"
+name = "extractable_derive"
 required-features = ["llm_cli"]
+
+[[test]]
+name = "systemone_derive"
+required-features = ["systemone"]
 
 [profile.dev]
 # ort/ONNX statically linked into every test binary — full debug info makes

@@ -142,15 +142,19 @@ let llm = SharedLlm::new(
 .with_max_text_len(4000);                // llm-local, defaults to 4000
 ```
 
-Consumer defines three things:
-
-**1. Output struct** — `#[schemars(description = ...)]` per field; these land
-in the JSON schema rendered into the prompt and steer the LLM. Describe
-meaning, nullability rules, format examples. `Option<T>` fields render as
-nullable in the schema and serde accepts `null` *or* omission.
+The consumer defines the domain in one annotated struct: `#[derive(JsonSchema)]`
++ `#[schemars(description)]` for the output shape and per-field guidance, plus
+`#[extract(template = "...", healthcheck = "...")]` for the prompt template and
+healthcheck fixture.
 
 ```rust
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+use patterns::Extractable;
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema, Extractable)]
+#[extract(
+    template = "prompts/job_ad.md",
+    healthcheck = "Senior Rust dev, fully remote, EUR 80k-100k",
+)]
 struct JobAd {
     #[schemars(description = "job title or role; if multiple listed, join them with ' + '")]
     title: String,
@@ -163,15 +167,15 @@ struct JobAd {
 }
 ```
 
-**2. Prompt template** — `render_prompt` is free-form; consumers either hand
-roll it (simple `format!` compositions) or use strongly typed askama
-templates registered via `define_prompts!`. Templates are strongly typed:
-exactly `{{ schema }}`, `{{ text }}`, `{{ prompt_context }}` available,
-compile error otherwise.
-
-```rust
-patterns::define_prompts!((JobAdExtract, "prompts/job_ad.md"));
-```
+- `#[schemars(description = ...)]` per field — lands in the JSON schema rendered
+  into the prompt and steers the LLM. Describe meaning, nullability rules,
+  format examples. `Option<T>` fields render as nullable and serde accepts
+  `null` *or* omission.
+- `#[extract(template = "...")]` — the strongly typed askama template; exactly
+  `{{ schema }}`, `{{ text }}`, `{{ prompt_context }}` are available (anything
+  else is a compile error). `render_prompt` is generated from it.
+- `#[extract(healthcheck = "...")]` — the fixture; generates
+  `HEALTHCHECK_TEXT`.
 
 `templates/prompts/job_ad.md`:
 
@@ -189,16 +193,10 @@ Post:
 {{ text }}
 ```
 
-**3. `Extractable` impl**
+The only hand-written piece is the semantic `verify` (picked up by name):
 
 ```rust
-impl patterns::llm_cli::Extractable for JobAd {
-    const HEALTHCHECK_TEXT: &'static str = "Senior Rust dev, fully remote, EUR 80k-100k";
-
-    fn render_prompt(schema: &str, text: &str, prompt_context: &str) -> anyhow::Result<String> {
-        PromptKind::JobAdExtract.render_prompt(schema, text, prompt_context)
-    }
-
+impl JobAd {
     // semantic smoke test on the known healthcheck text — proves the model
     // understands the task, not just that it emits schema-valid JSON
     fn verify(&self) -> anyhow::Result<()> {
@@ -262,17 +260,20 @@ never reads the environment.
 Same shape as `llm_cli`: the consumer owns the domain, the questions and the
 validation. The difference is the transport — instead of a prompt template and
 a CLI, SystemOne takes a `state` plus a typed question set and returns one
-answer per question id. `define_questions!` builds the typed questions *and*
-renders the shared input from a consumer-owned `.md` template (same askama
-machinery as `define_prompts!`, without the extraction schema) — both declared
-in one place, so the template and the questions can't drift apart.
+answer per question id.
 
-The consumer defines a typed question set (with its input template) and its
-validation:
+`#[derive(SystemOne)]` makes the annotated struct the source of truth — the
+same role `#[derive(JsonSchema)]` + `#[schemars(description)]` play for
+`llm_cli`. Field attributes declare each question; `#[systemone(template =
+"...")]` binds the input template (askama, `{{ text }}` + `{{ prompt_context }}`
+only); the derive emits `questions()` + `render_state`, so the questions and
+the template cannot drift apart. `#[systemone(healthcheck = "...")]`
+additionally emits the batch-gate `Evaluatable` impl.
 
 ```rust
+use patterns::SystemOne;
 use patterns::limits::ConcurrencyLimits;
-use patterns::systemone::{SharedSystemOne, Questions};
+use patterns::systemone::{Choice, Noul, Questions, Score, SharedSystemOne};
 
 let client = SharedSystemOne::new(
     "https://api.typesafe.ai".into(),
@@ -281,27 +282,30 @@ let client = SharedSystemOne::new(
     ConcurrencyLimits::default(),
 );
 
-// 1. domain: the struct + `Questions` impl + `render_state`, all from one
-//    declaration. The template path resolves at compile time (askama).
-patterns::define_questions! {
-    JobAssessment: "job_input.md" {
-        is_remote:   noul("Is the role fully remote, with no onsite or region restriction? Judge only from the job posting in the input."),
-        seniority:   choice(
-            "Which seniority level does the posting target?",
-            [
-                ("junior", "0-2 years, mentored work"),
-                ("mid", "3-5 years, works independently"),
-                ("senior", "6+ years, leads work and reviews others"),
-                ("staff", "org-wide technical leadership"),
-                ("unknown", "not stated or genuinely ambiguous"),
-            ],
-        ),
-        match_score: score(
-            "How strong is the match for a senior Rust/backend engineer?",
-            ["Poor", "Weak", "Fair", "Strong", "Excellent"],
-        ),
-        red_flags:   noul("Does the posting contain a red flag (unpaid trial, vague comp, 'rockstar/ninja' culture)?"),
-    }
+// 1. domain: one annotated struct -> `Questions` impl + `render_state`.
+#[derive(SystemOne, Debug, serde::Deserialize)]
+#[systemone(
+    template = "job_input.md",
+    healthcheck = "Senior Rust dev, fully remote, EUR 80k-100k",
+)]
+struct JobAssessment {
+    #[noul("Is the role fully remote, with no onsite or region restriction? Judge only from the job posting in the input.")]
+    is_remote: Noul,
+
+    #[choice("Which seniority level does the posting target?",
+        junior  = "0-2 years, mentored work",
+        mid     = "3-5 years, works independently",
+        senior  = "6+ years, leads work and reviews others",
+        staff   = "org-wide technical leadership",
+        unknown = "not stated or genuinely ambiguous")]
+    seniority: Choice,
+
+    #[score("How strong is the match for a senior Rust/backend engineer?",
+        "Poor", "Weak", "Fair", "Strong", "Excellent")]
+    match_score: Score,
+
+    #[noul("Does the posting contain a red flag (unpaid trial, vague comp, 'rockstar/ninja' culture)?")]
+    red_flags: Noul,
 }
 
 // 2. evaluate: `evaluate_text` renders the state from the template declared
@@ -344,15 +348,14 @@ included in the error context.
 
 ### Healthcheck as a batch gate
 
-Same pattern as `SharedLlm::verify::<T>()`: implement `Evaluatable` with a
-fixture text and validation; the gate renders that text through the **real**
-template and reuses the **real** questions, then call it **once per batch,
-before the pass** (never per item):
+Same pattern as `SharedLlm::verify::<T>()`. The `healthcheck = "..."`
+container attribute generates the `Evaluatable` impl; you write only the
+semantic `verify` as an inherent method (picked up by name). The gate renders
+the fixture through the **real** template and reuses the **real** questions —
+call it **once per batch, before the pass** (never per item):
 
 ```rust
-impl patterns::systemone::Evaluatable for JobAssessment {
-    const HEALTHCHECK_TEXT: &'static str = "Senior Rust dev, fully remote, EUR 80k-100k";
-
+impl JobAssessment {
     // semantic smoke test on the known fixture — proves the model understands
     // the task, not just that it emits parseable JSON
     fn verify(&self) -> anyhow::Result<()> {

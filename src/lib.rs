@@ -1,6 +1,10 @@
 //! Personal pattern library: reusable, strictly-linted building blocks
 //! shared across projects via a pinned git dependency.
 
+// Allow `#[derive(SystemOne)]`-generated `::patterns::` paths to resolve when
+// the derive is used inside this crate's own tests.
+extern crate self as patterns;
+
 /// Re-exported so macro-generated derives resolve without a direct `serde` dep.
 pub use serde;
 
@@ -35,65 +39,15 @@ const _: () = assert!(
     "ort API level changed: re-check the linked onnxruntime version (deploy pins 1.26, which supports API <= 26)"
 );
 
-/// Re-exported so `define_prompts!`/`define_questions!` consumers don't need
-/// own askama/paste deps.
-#[cfg(any(feature = "llm_cli", feature = "systemone"))]
+/// Re-exported so `#[derive(Extractable)]`/`#[derive(SystemOne)]` consumers
+/// don't need own askama deps (shared `templating` sub-feature).
+#[cfg(feature = "templating")]
 pub use askama;
-#[cfg(any(feature = "llm_cli", feature = "systemone"))]
-#[doc(hidden)]
-pub use pastey;
 
-/// Define an extraction-prompt enum backed by askama templates.
-///
-/// Template paths resolve against the *consumer* crate's template dirs
-/// (its `askama.toml` / `templates/`).
+/// `#[extract(..)]`-annotated extraction structs (see `llm_cli`).
 #[cfg(feature = "llm_cli")]
-#[macro_export]
-macro_rules! define_prompts {
-    ($(($variant:ident, $path:literal)),* $(,)?) => {
-        #[derive(Copy, Clone, Debug)]
-        pub enum PromptKind {
-            $($variant,)*
-        }
+pub use patterns_macros::Extractable;
 
-        $crate::pastey::paste! {
-            $(
-                #[derive($crate::askama::Template)]
-                #[template(path = $path, ext = "md", askama = $crate::askama)]
-                struct [<$variant Prompt>]<'a> {
-                    schema: &'a str,
-                    text: &'a str,
-                    prompt_context: &'a str,
-                }
-
-                impl<'a> [<$variant Prompt>]<'a> {
-                    fn render_prompt(
-                        schema: &'a str,
-                        text: &'a str,
-                        prompt_context: &'a str,
-                    ) -> ::anyhow::Result<String> {
-                        use $crate::askama::Template;
-                        Self { schema, text, prompt_context }
-                            .render()
-                            .map_err(Into::into)
-                    }
-                }
-            )*
-        }
-
-        impl PromptKind {
-            pub fn render_prompt(
-                self,
-                schema: &str,
-                text: &str,
-                prompt_context: &str,
-            ) -> ::anyhow::Result<String> {
-                $crate::pastey::paste! {
-                    match self {
-                        $(Self::$variant => [<$variant Prompt>]::render_prompt(schema, text, prompt_context),)*
-                    }
-                }
-            }
-        }
-    };
-}
+/// `#[derive(SystemOne)]` for annotated question structs (see `systemone`).
+#[cfg(feature = "systemone")]
+pub use patterns_macros::SystemOne;

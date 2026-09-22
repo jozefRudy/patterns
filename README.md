@@ -137,15 +137,14 @@ use patterns::limits::ConcurrencyLimits;
 
 let llm = SharedLlm::new(
     "pi".into(),
-    vec![
-        "--print".into(), "--no-session".into(), "--no-tools".into(),
-        "--no-extensions".into(), "--mode".into(), "text".into(),
-        "--thinking".into(), "off".into(),
-        "--model".into(), "deepseek/deepseek-v4-flash".into(),
+    [
+        "--print", "--no-session", "--no-tools", "--no-extensions",
+        "--mode", "text", "--thinking", "off",
+        "--model", "deepseek/deepseek-v4-flash",
     ],
-    ConcurrencyLimits::default(),       // max_concurrent_calls + call_timeout
+    ConcurrencyLimits::default(),   // max_concurrent_calls + call_timeout
 )
-.with_max_text_len(4000);                // llm-local, defaults to 4000
+.with_max_text_len(4000);           // llm-local, defaults to 4000
 ```
 
 The consumer defines the domain in one annotated struct: `#[derive(JsonSchema)]`

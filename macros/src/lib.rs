@@ -39,7 +39,7 @@ use syn::{Data, DeriveInput, Error, Field, Fields, Ident, LitStr, Result, Token}
 
 mod common;
 
-use common::{healthcheck_methods, parse_container, render_fn, template_struct};
+use common::{healthcheck_methods, parse_container, render_fn};
 
 /// Derive `Questions` (and optionally `Evaluatable`) for an annotated struct.
 #[proc_macro_derive(SystemOne, attributes(systemone, noul, choice, score))]
@@ -111,23 +111,15 @@ fn expand_extractable(input: &DeriveInput) -> Result<proc_macro2::TokenStream> {
     })?;
 
     let name = &input.ident;
-    let prompt_struct = format_ident!("{}Prompt", name);
     let template = &container.template;
-    let template_item = template_struct(
-        &prompt_struct,
-        template,
-        &["schema", "text", "prompt_context"],
-    );
     let render_prompt = render_fn(
         &format_ident!("render_prompt"),
-        &prompt_struct,
+        template,
         &["schema", "text", "prompt_context"],
     );
     let methods = healthcheck_methods(healthcheck);
 
     Ok(quote! {
-        #template_item
-
         impl ::patterns::llm_cli::Extractable for #name {
             #methods
 
@@ -403,12 +395,10 @@ fn expand(input: &DeriveInput) -> Result<proc_macro2::TokenStream> {
         .collect::<Result<Vec<_>>>()?;
 
     let name = &input.ident;
-    let input_struct = format_ident!("{}Input", name);
     let template = &container.template;
-    let template_item = template_struct(&input_struct, template, &["text", "prompt_context"]);
     let render_state = render_fn(
         &format_ident!("render_state"),
-        &input_struct,
+        template,
         &["text", "prompt_context"],
     );
 
@@ -422,8 +412,6 @@ fn expand(input: &DeriveInput) -> Result<proc_macro2::TokenStream> {
     });
 
     Ok(quote! {
-        #template_item
-
         impl ::patterns::systemone::Questions for #name {
             type Answers = Self;
 

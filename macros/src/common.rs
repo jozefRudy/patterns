@@ -56,28 +56,24 @@ pub fn parse_container(attr: &syn::Attribute) -> Result<Container> {
     })
 }
 
-/// Emit the askama template struct with one `&str` field per slot.
-pub fn template_struct(name: &Ident, template: &LitStr, slots: &[&str]) -> TokenStream {
-    let slots = slots.iter().map(|slot| Ident::new(slot, Span::call_site()));
-    quote! {
-        #[derive(::patterns::askama::Template)]
-        #[template(path = #template, ext = "md", askama = ::patterns::askama)]
-        struct #name<'a> {
-            #(#slots: &'a str,)*
-        }
-    }
-}
-
-/// Emit a `fn <fn_name>(<params>..) -> Result<String>` rendering `prompt_struct`.
-pub fn render_fn(fn_name: &Ident, prompt_struct: &Ident, params: &[&str]) -> TokenStream {
+/// Emit a `fn <fn_name>(<params>..) -> Result<String>` that declares the
+/// askama input struct locally (inside the fn body — no module-level symbol to
+/// collide with consumer types) and renders it.
+pub fn render_fn(fn_name: &Ident, template: &LitStr, params: &[&str]) -> TokenStream {
     let params = params
         .iter()
         .map(|param| Ident::new(param, Span::call_site()))
         .collect::<Vec<_>>();
     quote! {
         fn #fn_name(#(#params: &str),*) -> ::anyhow::Result<String> {
+            #[derive(::patterns::askama::Template)]
+            #[template(path = #template, ext = "md", askama = ::patterns::askama)]
+            struct Input<'a> {
+                #(#params: &'a str,)*
+            }
+
             use ::patterns::askama::Template as _;
-            #prompt_struct { #(#params),* }
+            Input { #(#params),* }
                 .render()
                 .map_err(::core::convert::Into::into)
         }
@@ -165,13 +161,13 @@ mod tests {
     }
 
     #[test]
-    fn template_struct_emits_all_slots() {
-        let name = quote::format_ident!("ProbePrompt");
+    fn render_fn_emits_local_template_struct() {
+        let fn_name = quote::format_ident!("render_state");
         let template: LitStr = syn::parse_quote!("t.md");
-        let tokens =
-            template_struct(&name, &template, &["schema", "text", "prompt_context"]).to_string();
-        assert!(tokens.contains("schema"));
-        assert!(tokens.contains("prompt_context"));
-        assert!(tokens.contains("askama :: Template"));
+        let tokens = render_fn(&fn_name, &template, &["text", "prompt_context"]).to_string();
+        assert!(tokens.contains("struct Input"), "{tokens}");
+        assert!(tokens.contains("text"), "{tokens}");
+        assert!(tokens.contains("prompt_context"), "{tokens}");
+        assert!(tokens.contains("askama :: Template"), "{tokens}");
     }
 }

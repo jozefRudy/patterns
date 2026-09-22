@@ -8,6 +8,8 @@ extern crate self as patterns;
 /// Re-exported so macro-generated derives resolve without a direct `serde` dep.
 pub use serde;
 
+#[cfg(any(feature = "embed", feature = "embed_api"))]
+pub mod chunk;
 #[cfg(feature = "embed")]
 pub mod embed;
 #[cfg(feature = "embed_api")]
@@ -17,6 +19,7 @@ pub mod language;
 pub mod limits;
 #[cfg(feature = "llm_cli")]
 pub mod llm_cli;
+pub mod prefixes;
 pub mod retry;
 #[cfg(feature = "systemone")]
 pub mod systemone;

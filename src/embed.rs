@@ -13,69 +13,9 @@ use anyhow::Result;
 use fastembed::{EmbeddingModel, ExecutionProviderDispatch, TextEmbedding, TextInitOptions};
 use ort::ep::cpu::CPU;
 
-/// Model's query/document prefixes (empty strings when the model uses none).
-#[derive(Clone, Debug)]
-pub struct Prefixes {
-    /// Prepended to queries, e.g. `"search_query: "`.
-    pub query: String,
-    /// Prepended to documents, e.g. `"search_document: "`.
-    pub document: String,
-}
-
-impl Prefixes {
-    /// No prefixes (symmetric models, e.g. BGE-M3).
-    #[must_use]
-    pub const fn none() -> Self {
-        Self {
-            query: String::new(),
-            document: String::new(),
-        }
-    }
-}
-
-/// Chunking policy for document embedding (model-agnostic limits).
-#[derive(Clone, Copy, Debug)]
-pub struct ChunkOptions {
-    /// Content tokens per chunk, excluding special tokens ([CLS]/[SEP]).
-    pub max_tokens: usize,
-    /// Token overlap between consecutive chunks.
-    pub overlap_tokens: usize,
-    /// Texts below this token count are not worth embedding.
-    pub min_tokens: usize,
-}
-
-impl ChunkOptions {
-    /// Options at `max_tokens` with the default overlap/minimum.
-    #[must_use]
-    pub const fn new(max_tokens: usize) -> Self {
-        Self {
-            max_tokens,
-            overlap_tokens: 64,
-            min_tokens: 5,
-        }
-    }
-}
-
-/// A slice of a source text, aligned to token boundaries.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TextChunk {
-    pub text: String,
-    pub tokens: usize,
-    /// `source[byte_start..byte_end]`, outer whitespace trimmed.
-    pub byte_start: usize,
-    pub byte_end: usize,
-}
-
-/// One embedded chunk — a storage row: `(doc_ix → content id, chunk_ix, vector)`.
-#[derive(Clone, Debug)]
-pub struct EmbeddedChunk {
-    /// Index of the source text in the batch's input slice (0 for single-doc calls).
-    pub doc_ix: usize,
-    /// Position of this chunk within its document.
-    pub chunk_ix: usize,
-    pub chunk: TextChunk,
-    pub embedding: Vec<f32>,
-}
+pub use crate::chunk::{ChunkOptions, EmbeddedChunk, TextChunk};
+use crate::chunk::{SPECIAL_TOKEN_HEADROOM, TokenSpan, chunk_spans, fake_token_spans};
+pub use crate::prefixes::Prefixes;
 
 /// Load-time configuration for [`Embedder`].
 #[derive(Clone, Debug)]
@@ -381,15 +321,7 @@ impl Embedder {
                 tokenizer
                     .with_truncation(None)
                     .map_err(|e| anyhow::anyhow!("disable truncation: {e}"))?;
-                let encoding = tokenizer
-                    .encode(text, false)
-                    .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
-                Ok(encoding
-                    .get_offsets()
-                    .iter()
-                    .filter(|(start, end)| start != end)
-                    .map(|(start, end)| *start..*end)
-                    .collect())
+                crate::chunk::token_spans(&tokenizer, text)
             }
         }
     }
@@ -408,13 +340,6 @@ impl Embedder {
         }
     }
 }
-
-/// Byte span of a single token within its source text.
-type TokenSpan = std::ops::Range<usize>;
-
-/// Tokens the tokenizer adds around every input ([CLS]/[SEP]) — excluded from
-/// chunk content so the model never truncates a chunk we built.
-const SPECIAL_TOKEN_HEADROOM: usize = 2;
 
 /// Token window reported by the `Fake` embedder (no model, no tokenizer).
 const FAKE_MODEL_MAX_TOKENS: usize = 512;
@@ -471,108 +396,6 @@ pub fn quantize_u8(values: &[f32]) -> Vec<u8> {
             scaled as u8
         })
         .collect()
-}
-
-/// Whitespace-word spans — the Fake embedder's documented token approximation.
-fn fake_token_spans(text: &str) -> Vec<TokenSpan> {
-    let mut spans = Vec::new();
-    let mut start: Option<usize> = None;
-    for (ix, ch) in text.char_indices() {
-        if ch.is_whitespace() {
-            if let Some(s) = start.take() {
-                spans.push(s..ix);
-            }
-        } else if start.is_none() {
-            start = Some(ix);
-        }
-    }
-    if let Some(s) = start {
-        spans.push(s..text.len());
-    }
-    spans
-}
-
-/// Trim ASCII/Unicode whitespace from a byte span.
-fn trim_span(text: &str, start: usize, end: usize) -> (usize, usize) {
-    let slice = text.get(start..end).unwrap_or_default();
-    let trimmed = slice.trim();
-    if trimmed.is_empty() {
-        return (start, start);
-    }
-    let lead = slice.len() - slice.trim_start().len();
-    let new_start = start + lead;
-    (new_start, new_start + trimmed.len())
-}
-
-/// Split pre-tokenized `spans` into chunks of at most `opts.max_tokens`,
-/// preferring paragraph, then sentence, then whitespace boundaries.
-///
-/// Invariant: every non-whitespace byte of `text` is inside exactly one chunk
-/// span's coverage (no tail loss); consecutive chunks overlap by at most
-/// `opts.overlap_tokens`.
-fn chunk_spans(text: &str, spans: &[TokenSpan], opts: &ChunkOptions) -> Vec<TextChunk> {
-    let max = opts.max_tokens.max(1);
-    let mut out = Vec::new();
-    if spans.is_empty() {
-        return out;
-    }
-    let mut start = 0_usize;
-    while start < spans.len() {
-        let remaining = spans.len() - start;
-        if remaining <= max {
-            if let Some(chunk) = make_chunk(text, spans, start, spans.len()) {
-                out.push(chunk);
-            }
-            break;
-        }
-        let end = start + max;
-        let break_tok = find_break(text, spans, start, end);
-        let break_tok = if break_tok > start { break_tok } else { end };
-        if let Some(chunk) = make_chunk(text, spans, start, break_tok) {
-            out.push(chunk);
-        }
-        let next = break_tok.saturating_sub(opts.overlap_tokens).max(start + 1);
-        start = next;
-    }
-    out
-}
-
-/// Last natural break inside `spans[start..end]`, as a token index.
-fn find_break(text: &str, spans: &[TokenSpan], start: usize, end: usize) -> usize {
-    let (Some(first), Some(last)) = (spans.get(start), spans.get(end.saturating_sub(1))) else {
-        return end;
-    };
-    let Some(window) = text.get(first.start..last.end) else {
-        return end;
-    };
-    let break_pos = ["\n\n", ". ", "! ", "? "]
-        .iter()
-        .filter_map(|sep| window.rfind(sep).map(|ix| ix + sep.len()))
-        .max()
-        .or_else(|| window.rfind(char::is_whitespace));
-    let Some(pos) = break_pos else {
-        return end;
-    };
-    let abs = first.start + pos;
-    let ix = spans.get(start..end).map_or(0, |window| {
-        window.iter().take_while(|span| span.end <= abs).count()
-    });
-    start + ix
-}
-
-fn make_chunk(text: &str, spans: &[TokenSpan], start: usize, end: usize) -> Option<TextChunk> {
-    let raw_start = spans.get(start)?.start;
-    let raw_end = spans.get(end.checked_sub(1)?)?.end;
-    let (byte_start, byte_end) = trim_span(text, raw_start, raw_end);
-    if byte_start >= byte_end {
-        return None;
-    }
-    Some(TextChunk {
-        text: text.get(byte_start..byte_end)?.to_string(),
-        tokens: end - start,
-        byte_start,
-        byte_end,
-    })
 }
 
 /// FNV-1a hash (fake-vector seeding).
@@ -788,10 +611,7 @@ mod tests {
 
     #[tokio::test]
     async fn document_prefix_is_applied_to_every_chunk() {
-        let prefixes = Prefixes {
-            query: "search_query: ".to_string(),
-            document: "search_document: ".to_string(),
-        };
+        let prefixes = Prefixes::new("search_query: ", "search_document: ");
         let e = Embedder::fake_with_prefixes(8, &prefixes);
         let opts = ChunkOptions {
             max_tokens: 3,

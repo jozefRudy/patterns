@@ -9,8 +9,15 @@
 //! `dims = None` sends no `dimensions` field (the model's native output, as for
 //! non-MRL models); `dims = Some(n)` requests an MRL-truncated `n`-dimensional
 //! output (`n >= 32`). Truncated vectors are not renormalized.
+//!
+//! Query/document prefixes (via [`Prefixes`], model config) are applied by
+//! [`EmbeddingApi::embed_query`] and [`EmbeddingApi::embed_documents`];
+//! documents are always chunked to the declared `max_tokens` window (requires
+//! `.with_max_tokens` + `.with_tokenizer`), queries never are.
 
+use crate::chunk::{ChunkOptions, EmbeddedChunk, TextChunk};
 use crate::limits::ConcurrencyLimits;
+use crate::prefixes::Prefixes;
 use crate::retry::{HttpResponse, RetryPolicy};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -102,6 +109,8 @@ struct ApiConfig {
     dims: Option<usize>,
     service_tier: Option<String>,
     max_batch_size: usize,
+    prefixes: Prefixes,
+    max_tokens: Option<usize>,
     limits: ConcurrencyLimits,
 }
 
@@ -127,6 +136,8 @@ impl fmt::Debug for EmbeddingApi {
             .field("dims", &self.config.dims)
             .field("service_tier", &self.config.service_tier)
             .field("max_batch_size", &self.config.max_batch_size)
+            .field("prefixes", &self.config.prefixes)
+            .field("max_tokens", &self.config.max_tokens)
             .field("limits", &self.config.limits)
             .field("tokenizer_source", &self.tokenizer_source)
             .field("hf_home", &self.hf_home)
@@ -165,12 +176,34 @@ impl EmbeddingApi {
             dims,
             service_tier: None,
             max_batch_size: DEFAULT_MAX_BATCH_SIZE,
+            prefixes: Prefixes::none(),
+            max_tokens: None,
             limits,
         };
         Ok(Self::with_transport(
             Arc::new(HttpTransport { client }),
             config,
         ))
+    }
+
+    /// Set the model's query/document prefixes (see [`Prefixes`]). Defaults to
+    /// none; [`Self::embed_query`] and [`Self::embed_documents`] apply them.
+    #[must_use]
+    pub fn with_prefixes(mut self, prefixes: &Prefixes) -> Self {
+        self.config.prefixes = prefixes.clone();
+        self
+    }
+
+    /// Declare the model's context window in tokens (read from the model card).
+    ///
+    /// Required before [`Self::default_chunk_options`]; not introspectable from
+    /// an OpenAI-compatible endpoint. Set it from the card, not `config.json`
+    /// (`max_position_embeddings` / `model_max_length` often exceed the real
+    /// window — e.g. Qwen3-Embedding-8B: 40960 / 131072 vs 32768).
+    #[must_use]
+    pub const fn with_max_tokens(mut self, max_tokens: usize) -> Self {
+        self.config.max_tokens = Some(max_tokens);
+        self
     }
 
     /// Set the optional `service_tier` (e.g. `"flex"`); omitted when unset.
@@ -233,14 +266,79 @@ impl EmbeddingApi {
         }
     }
 
-    /// Embed `inputs`, preserving input order.
+    /// Embed one query with the model's query prefix.
     ///
-    /// Batched and bounded by the shared [`ConcurrencyLimits`]; transient
-    /// failures (429/5xx/timeouts) are retried with backoff, payload 4xx fail
-    /// immediately. Empty input makes no request.
-    pub async fn embed(&self, inputs: &[impl AsRef<str> + Sync]) -> Result<Vec<Vec<f32>>> {
-        let owned: Vec<String> = inputs.iter().map(|s| s.as_ref().to_owned()).collect();
-        self.embed_owned(owned).await
+    /// Queries are never chunked — one vector per call. Transient failures
+    /// (429/5xx/timeouts) are retried with backoff, payload 4xx fail
+    /// immediately.
+    pub async fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        let prefix = &self.config.prefixes.query;
+        let mut vectors = self.embed_owned(vec![format!("{prefix}{text}")]).await?;
+        vectors
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("expected one embedding, got none"))
+    }
+
+    /// Embed documents, chunked to `opts`, returning a flat row batch.
+    ///
+    /// Each document is split on token boundaries (see [`ChunkOptions`]), the
+    /// document prefix is applied per chunk, and all chunks across the batch go
+    /// out as one bounded-concurrency request batch. No tail loss; rows are
+    /// ordered by `(doc_ix, chunk_ix)`. Documents below `opts.min_tokens`
+    /// contribute no rows — derive the skip set from the `doc_ix` values
+    /// present. Requires [`.with_tokenizer`](Self::with_tokenizer).
+    pub async fn embed_documents(
+        &self,
+        texts: &[impl AsRef<str> + Sync],
+        opts: &ChunkOptions,
+    ) -> Result<Vec<EmbeddedChunk>> {
+        let tokenizer = self.tokenizer().await?;
+        let mut pending: Vec<(usize, usize, TextChunk)> = Vec::new();
+        for (doc_ix, text) in texts.iter().enumerate() {
+            let text = text.as_ref();
+            let spans = crate::chunk::token_spans(tokenizer, text)?;
+            if spans.len() < opts.min_tokens {
+                continue;
+            }
+            pending.extend(
+                crate::chunk::chunk_spans(text, &spans, opts)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(chunk_ix, chunk)| (doc_ix, chunk_ix, chunk)),
+            );
+        }
+        if pending.is_empty() {
+            return Ok(Vec::new());
+        }
+        let prefix = &self.config.prefixes.document;
+        let prefixed: Vec<String> = pending
+            .iter()
+            .map(|(_, _, chunk)| format!("{prefix}{}", chunk.text))
+            .collect();
+        let embeddings = self.embed_owned(prefixed).await?;
+        Ok(pending
+            .into_iter()
+            .zip(embeddings)
+            .map(|((doc_ix, chunk_ix, chunk), embedding)| EmbeddedChunk {
+                doc_ix,
+                chunk_ix,
+                chunk,
+                embedding,
+            })
+            .collect())
+    }
+
+    /// Chunk options sized to the declared context window (see
+    /// [`Self::with_max_tokens`]), minus the special tokens the tokenizer adds
+    /// to every input ([CLS]/[SEP]). Errors when `max_tokens` is not set.
+    pub fn default_chunk_options(&self) -> Result<ChunkOptions> {
+        let max = self
+            .config
+            .max_tokens
+            .context("max_tokens not configured (call .with_max_tokens)")?
+            .saturating_sub(crate::chunk::SPECIAL_TOKEN_HEADROOM)
+            .max(1);
+        Ok(ChunkOptions::new(max))
     }
 
     /// Batched implementation over owned inputs.
@@ -476,9 +574,102 @@ mod tests {
             dims,
             service_tier: None,
             max_batch_size: DEFAULT_MAX_BATCH_SIZE,
+            prefixes: Prefixes::none(),
+            max_tokens: None,
             limits: ConcurrencyLimits::default(),
         };
         EmbeddingApi::with_transport(transport, config)
+    }
+
+    #[tokio::test]
+    async fn applies_query_and_document_prefixes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tokenizer.json");
+        std::fs::write(&path, WORDLEVEL_TOKENIZER).expect("write tokenizer");
+        let prefixes = Prefixes::query_only("Instruct: retrieve\nQuery: ");
+        let transport = FakeTransport::new(vec![
+            ok(response_body(&[(0, vec![1.0])])),
+            ok(response_body(&[(0, vec![2.0])])),
+        ]);
+        let api = client(transport.clone())
+            .with_prefixes(&prefixes)
+            .with_tokenizer(path.to_str().expect("utf8 path"));
+
+        api.embed_query("capital").await.expect("query");
+        let query_input = transport
+            .last_request()
+            .body
+            .get("input")
+            .cloned()
+            .expect("input field");
+        assert_eq!(query_input, json!(["Instruct: retrieve\nQuery: capital"]));
+
+        let opts = ChunkOptions {
+            max_tokens: 16,
+            overlap_tokens: 0,
+            min_tokens: 1,
+        };
+        let rows = api
+            .embed_documents(&["hello world"], &opts)
+            .await
+            .expect("documents");
+        let document_input = transport
+            .last_request()
+            .body
+            .get("input")
+            .cloned()
+            .expect("input field");
+        assert_eq!(
+            document_input,
+            json!(["hello world"]),
+            "empty document prefix leaves input unchanged"
+        );
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn chunks_documents_and_skips_short() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tokenizer.json");
+        std::fs::write(&path, WORDLEVEL_TOKENIZER).expect("write tokenizer");
+        let transport =
+            FakeTransport::new(vec![ok(response_body(&[(0, vec![0.0]), (1, vec![1.0])]))]);
+        let api = client(transport.clone()).with_tokenizer(path.to_str().expect("utf8 path"));
+        let opts = ChunkOptions {
+            max_tokens: 1,
+            overlap_tokens: 0,
+            min_tokens: 2,
+        };
+
+        // doc0 "hello world" (2 tokens) -> two 1-token chunks; doc1 "hello"
+        // (1 token) is below min_tokens and contributes nothing.
+        let rows = api
+            .embed_documents(&["hello world", "hello"], &opts)
+            .await
+            .expect("documents");
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(transport.call_count(), 1, "one batched request");
+        let first = rows.first().expect("first row");
+        let second = rows.get(1).expect("second row");
+        assert_eq!((first.doc_ix, first.chunk_ix), (0, 0));
+        assert_eq!((second.doc_ix, second.chunk_ix), (0, 1));
+        assert_eq!(first.chunk.text, "hello");
+        assert_eq!(second.chunk.text, "world");
+    }
+
+    #[test]
+    fn default_chunk_options_require_max_tokens() {
+        let configured = client(FakeTransport::new(vec![])).with_max_tokens(512);
+        let opts = configured.default_chunk_options().expect("opts");
+        assert_eq!(opts.max_tokens, 512 - crate::chunk::SPECIAL_TOKEN_HEADROOM);
+
+        let unset = client(FakeTransport::new(vec![]));
+        let error = unset.default_chunk_options().expect_err("must error");
+        assert!(
+            format!("{error:#}").contains("not configured"),
+            "error: {error:#}"
+        );
     }
 
     #[tokio::test]
@@ -487,7 +678,7 @@ mod tests {
         let api = client_with_dims(transport.clone(), Some(64))
             .with_service_tier("flex")
             .with_max_batch_size(2);
-        api.embed(&["hello"]).await.expect("embed");
+        api.embed_query("hello").await.expect("embed");
 
         let request = transport.last_request();
         assert_eq!(request.url, "https://example.test/v1/openai/embeddings");
@@ -508,7 +699,7 @@ mod tests {
     async fn omits_dimensions_and_service_tier_when_unset() {
         let transport = FakeTransport::new(vec![ok(response_body(&[(0, vec![0.1])]))]);
         let api = client(transport.clone());
-        api.embed(&["hello"]).await.expect("embed");
+        api.embed_query("hello").await.expect("embed");
 
         assert_eq!(
             transport.last_request().body,
@@ -526,7 +717,10 @@ mod tests {
             (1, vec![1.0, 1.1]),
             (0, vec![0.0, 0.1]),
         ]))]);
-        let out = client(transport).embed(&["a", "b"]).await.expect("embed");
+        let out = client(transport)
+            .embed_owned(vec!["a".to_owned(), "b".to_owned()])
+            .await
+            .expect("embed");
 
         assert_eq!(out.len(), 2);
         let first = out.first().expect("first").first().copied().expect("dim");
@@ -543,7 +737,16 @@ mod tests {
             ok(response_body(&[(0, vec![4.0])])),
         ]);
         let api = client(transport.clone()).with_max_batch_size(2);
-        let out = api.embed(&["a", "b", "c", "d", "e"]).await.expect("embed");
+        let out = api
+            .embed_owned(vec![
+                "a".to_owned(),
+                "b".to_owned(),
+                "c".to_owned(),
+                "d".to_owned(),
+                "e".to_owned(),
+            ])
+            .await
+            .expect("embed");
 
         assert_eq!(transport.call_count(), 3, "one request per batch");
         for (got, want) in firsts(&out).into_iter().zip([0.0, 1.0, 2.0, 3.0, 4.0]) {
@@ -558,7 +761,7 @@ mod tests {
             ok(response_body(&[(0, vec![1.0])])),
         ]);
         let out = client(transport.clone())
-            .embed(&["a"])
+            .embed_query("a")
             .await
             .expect("embed");
 
@@ -570,7 +773,7 @@ mod tests {
     async fn fails_fast_on_payload_error() {
         let transport = FakeTransport::new(vec![failing(400, "bad input")]);
         let error = client(transport.clone())
-            .embed(&["a"])
+            .embed_query("a")
             .await
             .expect_err("must fail");
 
@@ -582,7 +785,7 @@ mod tests {
     async fn rejects_short_response() {
         let transport = FakeTransport::new(vec![ok(response_body(&[(0, vec![1.0])]))]);
         let error = client(transport)
-            .embed(&["a", "b"])
+            .embed_owned(vec!["a".to_owned(), "b".to_owned()])
             .await
             .expect_err("must fail");
         assert!(
@@ -610,8 +813,10 @@ mod tests {
     #[tokio::test]
     async fn empty_input_makes_no_request() {
         let transport = FakeTransport::new(vec![]);
-        let empty: &[&str] = &[];
-        let out = client(transport.clone()).embed(empty).await.expect("embed");
+        let out = client(transport.clone())
+            .embed_owned(Vec::new())
+            .await
+            .expect("embed");
         assert_eq!(out.len(), 0);
         assert_eq!(transport.call_count(), 0);
     }
@@ -689,36 +894,73 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "live: requires EMBED_API_KEY"]
-    async fn live_mrl_dimensions() {
-        let text = ["hello world", "second input"];
-        let native = live_client(None).embed(&text).await.expect("native embed");
+    async fn live_qwen_round_trip() {
+        // MRL: native output exceeds the requested truncation; truncated == 128.
+        let native = live_client(None)
+            .embed_query("hello world")
+            .await
+            .expect("native embed");
         let truncated = live_client(Some(128))
-            .embed(&text)
+            .embed_query("hello world")
             .await
             .expect("mrl embed");
+        assert!(
+            native.len() > 128,
+            "model native dims {} must exceed requested 128",
+            native.len()
+        );
+        assert_eq!(truncated.len(), 128, "truncated dims must equal requested");
 
-        assert_eq!(native.len(), 2);
-        let native_len = native.first().expect("native vector").len();
-        assert!(
-            native.iter().all(|v| v.len() == native_len),
-            "native dims must be consistent"
-        );
-        assert!(
-            native_len > 128,
-            "model native dims {native_len} must exceed requested 128"
-        );
-        assert!(
-            truncated.iter().all(|v| v.len() == 128),
-            "truncated dims must equal requested"
-        );
-
+        // Tokenizer comes from the HF repo (downloads tokenizer.json once).
         let cache = tempfile::tempdir().expect("tempdir");
-        let counted = live_client(None)
+        let api = live_client(Some(128))
             .with_tokenizer("Qwen/Qwen3-Embedding-8B")
             .with_hf_home(cache.path())
-            .token_count("hello world")
+            .with_max_tokens(32_768);
+        assert!(api.token_count("hello world").await.expect("count") > 0);
+        assert_eq!(
+            api.default_chunk_options().expect("opts").max_tokens,
+            32_768 - crate::chunk::SPECIAL_TOKEN_HEADROOM
+        );
+
+        // Full chunked-document round trip: a long doc splits into several rows,
+        // a doc below `min_tokens` contributes none.
+        let long = (0..400)
+            .map(|i| format!("Sentence {i} about retrieval and embeddings."))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let docs = [long.as_str(), "too short"];
+        let opts = ChunkOptions {
+            max_tokens: 64,
+            overlap_tokens: 8,
+            min_tokens: 10,
+        };
+        let rows = api
+            .embed_documents(&docs, &opts)
             .await
-            .expect("token_count");
-        assert!(counted > 0, "token count must be positive");
+            .expect("embed_documents");
+
+        assert!(rows.len() > 1, "long document must chunk into several rows");
+        let pairs: Vec<(usize, usize)> = rows.iter().map(|r| (r.doc_ix, r.chunk_ix)).collect();
+        let mut sorted = pairs.clone();
+        sorted.sort_unstable();
+        assert_eq!(pairs, sorted, "rows ordered by (doc_ix, chunk_ix)");
+        for r in &rows {
+            assert_eq!(
+                r.doc_ix, 0,
+                "short doc below min_tokens contributes nothing"
+            );
+            assert_eq!(r.embedding.len(), 128, "MRL dims on document chunks");
+            assert_eq!(
+                long.get(r.chunk.byte_start..r.chunk.byte_end),
+                Some(r.chunk.text.as_str()),
+                "chunk text must match its source span"
+            );
+        }
+        assert_eq!(
+            rows.last().expect("rows").chunk.byte_end,
+            long.len(),
+            "chunking must cover the tail"
+        );
     }
 }

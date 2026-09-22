@@ -56,7 +56,7 @@ use patterns::fastembed::EmbeddingModel;
 // model + optional query/document prefixes (empty for symmetric models)
 let embedder = Embedder::load(
     LoadOptions::new(EmbeddingModel::MxbaiEmbedLargeV1Q)
-        .with_prefixes(&Prefixes { query: "search_query: ".into(), document: "search_document: ".into() })
+        .with_prefixes(&Prefixes::new("search_query: ", "search_document: "))
         .with_intra_threads(4),      // leave cores for other tasks
     &cache_dir,
 ).await?;
@@ -112,6 +112,11 @@ Call any OpenAI-compatible `/embeddings` endpoint. The caller owns config
 ```rust
 use patterns::embed_api::EmbeddingApi;
 use patterns::limits::ConcurrencyLimits;
+use patterns::prefixes::Prefixes;
+
+let prefixes = Prefixes::query_only(
+    "Instruct: Given a web search query, retrieve relevant passages\nQuery: ",
+);
 
 let api = EmbeddingApi::new(
     "https://api.deepinfra.com/v1/openai",
@@ -120,10 +125,20 @@ let api = EmbeddingApi::new(
     Some(512),                    // MRL truncation; None = model native dims
     ConcurrencyLimits::default(), // process-wide concurrency cap + per-call timeout
 )?
+.with_prefixes(&prefixes)           // optional; model config, shared with `embed`
+.with_max_tokens(32_768)            // model context window (from the card); for chunking
+.with_tokenizer("Qwen/Qwen3-Embedding-8B")  // for chunking + `token_count`
+.with_hf_home(cache_dir)            // required when `with_tokenizer` is an HF repo id
 .with_service_tier("flex")          // optional; omitted when unset
 .with_max_batch_size(512);         // optional; default 256
 
-let vectors = api.embed(&["first text", "second text"]).await?;
+// query: one vector, never chunked
+let q = api.embed_query("first query").await?;
+
+// documents: always chunked to the declared window, one batched call
+let opts = api.default_chunk_options()?;   // ctx − special tokens, 64 overlap, 5 min
+let rows = api.embed_documents(&["first text", "second text"], &opts).await?;
+// rows: EmbeddedChunk { doc_ix, chunk_ix, chunk, embedding }, ordered by (doc_ix, chunk_ix)
 ```
 
 Notes:
@@ -132,12 +147,26 @@ Notes:
   vectors are **not** renormalized — normalize downstream if you need unit length.
 - Inputs are split into batches and issued with bounded concurrency; results
   come back in input order. Retries cover 429/5xx/timeouts; other 4xx fail fast.
-- `.with_tokenizer(source)` enables `token_count(text).await` for local gating
-  (e.g. skip texts too short to embed). `source` is an HF repo id (only
+- `embed_query` embeds **one** query (never chunked); `embed_documents` chunks
+  each document to `opts`, applies the document prefix per chunk, and embeds all
+  chunks across the batch in one call. Same document-always-chunked rule as the
+  in-process `embed` backend.
+- `.with_max_tokens(n)` declares the model's context window (read it from the
+  model card — `config.json`/`tokenizer_config.json` fields like
+  `max_position_embeddings`/`model_max_length` can exceed the real window).
+  `.default_chunk_options()` derives `ChunkOptions` from it and errors until set.
+- `.with_tokenizer(source)` enables `token_count(text).await` and is required by
+  `embed_documents`. `source` is an HF repo id (only
   `tokenizer.json` is fetched; requires `.with_hf_home(path)` — cache
   `{path}/hub`, token file `{path}/token`) or a local `tokenizer.json` path
   (no `hf_home` needed). The client never reads `HF_HOME` from the environment.
   Lazy-loaded once and shared across clones; without it `token_count` errors.
+- `.with_prefixes(&Prefixes)` sets the model's fixed query/document prefixes;
+  `embed_query` prepends `query`, `embed_documents` prepends `document` to each
+  chunk. Defaults to none (symmetric models). `Prefixes`
+  lives in `patterns::prefixes` (re-exported as `patterns::embed::Prefixes`).
+  For asymmetric open models this replaces a provider's native `input_type` —
+  e.g. Qwen3-Embedding's `Instruct: <task>\nQuery: ` query prefix.
 - Only the OpenAI-compatible schema is supported (DeepInfra, OpenAI, Together,
   SiliconFlow). Native Cohere/Voyage/Jina APIs are out of scope.
 

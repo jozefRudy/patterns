@@ -659,6 +659,16 @@ mod tests {
         )
     }
 
+    /// Client built from the live-test env vars; only called by `#[ignore]`d tests.
+    fn live_client() -> SharedSystemOne {
+        let api_key = std::env::var("TYPESAFE_API_KEY").expect("TYPESAFE_API_KEY set");
+        let base_url = std::env::var("TYPESAFE_BASE_URL")
+            .unwrap_or_else(|_| "https://api.typesafe.ai".to_owned());
+        let model =
+            std::env::var("TYPESAFE_DEFAULT_MODEL").unwrap_or_else(|_| "jev-latest".to_owned());
+        SharedSystemOne::new(base_url, api_key, model, ConcurrencyLimits::default())
+    }
+
     const NOUL_RESPONSE: &str = r#"{"answers":{"urgency":{"type":"noul","noul":0.7}},"model":"jev-test","usage":{"input_tokens":3,"output_tokens":1}}"#;
 
     #[test]
@@ -968,12 +978,55 @@ mod tests {
     #[tokio::test]
     #[ignore = "live: requires TYPESAFE_API_KEY"]
     async fn live_verify() {
-        let api_key = std::env::var("TYPESAFE_API_KEY").expect("TYPESAFE_API_KEY set");
-        let base_url = std::env::var("TYPESAFE_BASE_URL")
-            .unwrap_or_else(|_| "https://api.typesafe.ai".to_owned());
-        let model =
-            std::env::var("TYPESAFE_DEFAULT_MODEL").unwrap_or_else(|_| "jev-latest".to_owned());
-        let handle = SharedSystemOne::new(base_url, api_key, model, ConcurrencyLimits::default());
-        handle.verify::<NoulOut>().await.expect("live verify");
+        live_client()
+            .verify::<NoulOut>()
+            .await
+            .expect("live verify");
+    }
+
+    /// Reads the raw wire `score` and the production `expected()` from an answer value.
+    fn wire_score_vs_expected(raw: &Value) -> (f64, f32) {
+        let wire = raw
+            .get("score")
+            .and_then(Value::as_f64)
+            .expect("wire score present");
+        let score: Score = serde_json::from_value(raw.clone()).expect("parse Score");
+        (wire, score.expected())
+    }
+
+    /// Asserts the endpoint's `score` equals our `expected()` (verified live).
+    #[tokio::test]
+    #[ignore = "live: requires TYPESAFE_API_KEY"]
+    async fn live_score_matches_expected() {
+        let handle = live_client();
+        let questions = QuestionMap::from([(
+            "rating".to_owned(),
+            score(
+                "Rate the sentiment of the input text.",
+                [
+                    "Very negative",
+                    "Negative",
+                    "Neutral",
+                    "Positive",
+                    "Very positive",
+                ],
+            ),
+        )]);
+
+        for text in [
+            "It's okay, I guess — not great, not terrible, just fine.",
+            "Honestly a bit disappointing, though there were some good moments.",
+        ] {
+            let answers: BTreeMap<String, Value> = handle
+                .evaluate_map(&json!(text), &questions)
+                .await
+                .expect("evaluate");
+            let (wire_score, expected) =
+                wire_score_vs_expected(answers.get("rating").expect("rating"));
+            assert!(
+                (wire_score - f64::from(expected)).abs() < 0.01,
+                "wire score {wire_score} != expected {expected} for {text:?}"
+            );
+        }
     }
 }

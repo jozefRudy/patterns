@@ -1,13 +1,16 @@
 # patterns
 
 Personal pattern library: reusable building blocks shared across my projects
-via a pinned git dependency. One crate, module per pattern.
+via a pinned git dependency. One consumer-facing crate, module per pattern;
+an internal `patterns-macros` proc-macro crate provides the `#[derive(Extractable)]`
+and `#[derive(SystemOne)]` derives (consumers still depend on `patterns` alone).
 
 Modules (feature-gated; `default = ["llm_cli", "embed", "language", "systemone"]`):
 - `llm_cli` (feature `llm_cli`) — structured extraction from text via a local
   LLM CLI, with one-repair-retry semantics, via `SharedLlm`: a cloneable
-  handle with a process-wide concurrency cap. Prompt templating stays in
-  consumers.
+  handle with a process-wide concurrency cap. The domain is one annotated
+  struct (`#[derive(Extractable)]` + `#[extract(template = "…", healthcheck = "…")]`);
+  template files stay in consumers.
 - `embed` (feature `embed`) — text embeddings via fastembed (ONNX, CPU,
   in-process). Model, thread count and query/document prefixes configured at
   load; query/document methods apply prefixes automatically.
@@ -21,7 +24,8 @@ Modules (feature-gated; `default = ["llm_cli", "embed", "language", "systemone"]
   `SharedSystemOne`: a cloneable handle with a process-wide concurrency cap and
   a per-call timeout, no retries. Base URL/API key/model come from the caller
   (never read from env); backends differ only by base URL. Questions are
-  independent; define an `Evaluatable` impl for the batch healthcheck.
+  independent; `#[derive(SystemOne)]` generates the typed question set and,
+  with `healthcheck = "…"`, the batch-gate `Evaluatable` impl.
 - `lance_store` — reserved.
 
 Usage (consumers pin exactly what they use — don't rely on defaults):
@@ -33,7 +37,9 @@ patterns = { git = "https://github.com/jozefRudy/patterns", rev = "<sha>", defau
 Deps with versions that matter are pinned exactly in this crate
 (`fastembed =6.1.0`, `ort =2.0.0-rc.13` — which transitively pins a
 sha256-verified ONNX Runtime binary) and re-exported (`patterns::fastembed`,
-`patterns::ort`); consumers never declare them separately.
+`patterns::ort`, `patterns::askama`); consumers never declare them separately.
+`patterns-macros` is an internal workspace member (path dependency) re-exported
+as `patterns::Extractable` / `patterns::SystemOne`.
 
 ## `embed` usage
 

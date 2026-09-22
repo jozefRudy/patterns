@@ -10,6 +10,8 @@ pub use serde;
 
 #[cfg(feature = "embed")]
 pub mod embed;
+#[cfg(feature = "embed_api")]
+pub mod embed_api;
 #[cfg(feature = "language")]
 pub mod language;
 pub mod limits;

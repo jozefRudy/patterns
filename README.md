@@ -126,7 +126,8 @@ let api = EmbeddingApi::new(
     ConcurrencyLimits::default(), // process-wide concurrency cap + per-call timeout
 )?
 .with_prefixes(&prefixes)           // optional; model config, shared with `embed`
-.with_max_tokens(32_768)            // model ctx window — from the card (see Notes); for chunking
+.with_max_tokens(32_768)            // model ctx window (card): https://huggingface.co/Qwen/Qwen3-Embedding-8B
+                                    // — read "Context Length" from the card; for chunking
 .with_tokenizer("Qwen/Qwen3-Embedding-8B")  // for chunking + `token_count`
 .with_hf_home(cache_dir)            // required when `with_tokenizer` is an HF repo id
 .with_service_tier("flex")          // optional; omitted when unset

@@ -136,7 +136,7 @@ at construction (env var reading stays in the consumer):
 use patterns::limits::ConcurrencyLimits;
 
 let llm = SharedLlm::new(
-    "pi".into(),
+    "pi",
     [
         "--print", "--no-session", "--no-tools", "--no-extensions",
         "--mode", "text", "--thinking", "off",

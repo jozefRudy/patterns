@@ -87,13 +87,13 @@ impl<T: Extractable> LlmExtractor<T> {
     /// Configure with a bin path and pre-split args (anything iterable of
     /// `Into<String>`, e.g. `["--print", "--model", id]`).
     #[must_use]
-    pub fn from_parts<I, S>(bin: String, args: I) -> Self
+    pub fn from_parts<I, S>(bin: impl Into<String>, args: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
         Self {
-            bin,
+            bin: bin.into(),
             args: args.into_iter().map(Into::into).collect(),
             prompt_context: String::new(),
             max_text_len: DEFAULT_MAX_TEXT_LEN,
@@ -211,13 +211,13 @@ impl SharedLlm {
     /// [`with_max_text_len`](Self::with_max_text_len). `args` is anything
     /// iterable of `Into<String>`, e.g. `["--print", "--model", id]`.
     #[must_use]
-    pub fn new<I, S>(bin: String, args: I, limits: ConcurrencyLimits) -> Self
+    pub fn new<I, S>(bin: impl Into<String>, args: I, limits: ConcurrencyLimits) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
         Self {
-            bin,
+            bin: bin.into(),
             args: args.into_iter().map(Into::into).collect(),
             max_text_len: DEFAULT_MAX_TEXT_LEN,
             permits: Arc::new(Semaphore::new(limits.max_concurrent_calls)),
@@ -398,7 +398,7 @@ mod tests {
 
     #[test]
     fn test_from_parts_keeps_args_verbatim() {
-        let e = LlmExtractor::<Dummy>::from_parts("llm".to_owned(), ["-m", "sonnet", "quoted arg"]);
+        let e = LlmExtractor::<Dummy>::from_parts("llm", ["-m", "sonnet", "quoted arg"]);
         assert_eq!(e.bin, "llm");
         assert_eq!(e.args, vec!["-m", "sonnet", "quoted arg"]);
     }
@@ -412,7 +412,7 @@ mod tests {
 
     #[test]
     fn test_builder_defaults_and_overrides() {
-        let e = LlmExtractor::<Dummy>::from_parts("llm".to_owned(), Vec::<String>::new());
+        let e = LlmExtractor::<Dummy>::from_parts("llm", Vec::<String>::new());
         assert_eq!(e.max_text_len, DEFAULT_MAX_TEXT_LEN);
         assert_eq!(e.timeout, DEFAULT_TIMEOUT);
         let e = e

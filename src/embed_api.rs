@@ -148,25 +148,18 @@ impl fmt::Debug for EmbeddingApi {
 }
 
 impl EmbeddingApi {
-    /// Build from a base URL, API key, model, optional requested dimensions and
-    /// shared limits.
+    /// Build from a base URL, API key, model and shared limits.
     ///
     /// `base_url` is the OpenAI-compatible root without a trailing slash, e.g.
     /// `"https://api.deepinfra.com/v1/openai"` or `"https://api.openai.com/v1"`.
-    /// `dims = Some(n)` is an MRL request and must be `>= 32`.
+    /// Vectors use the model's native dimensions unless
+    /// [`.with_mrl_truncation`](Self::with_mrl_truncation) is called.
     pub fn new(
         base_url: impl Into<String>,
         api_key: impl Into<String>,
         model: impl Into<String>,
-        dims: Option<usize>,
         limits: ConcurrencyLimits,
     ) -> Result<Self> {
-        if let Some(n) = dims {
-            anyhow::ensure!(
-                n >= MIN_DIMS,
-                "requested dimensions {n} below minimum {MIN_DIMS}"
-            );
-        }
         let client = reqwest::Client::builder()
             .build()
             .context("build reqwest client")?;
@@ -174,7 +167,7 @@ impl EmbeddingApi {
             base_url: base_url.into(),
             api_key: api_key.into(),
             model: model.into(),
-            dims,
+            dims: None,
             service_tier: None,
             max_batch_size: DEFAULT_MAX_BATCH_SIZE,
             prefixes: Prefixes::none(),
@@ -185,6 +178,21 @@ impl EmbeddingApi {
             Arc::new(HttpTransport { client }),
             config,
         ))
+    }
+
+    /// Request Matryoshka (MRL) truncation to `dims` dimensions; default is the
+    /// model's native dimensions.
+    ///
+    /// # Panics
+    /// If `dims < 32`.
+    #[must_use]
+    pub fn with_mrl_truncation(mut self, dims: usize) -> Self {
+        assert!(
+            dims >= MIN_DIMS,
+            "requested dimensions {dims} below minimum {MIN_DIMS}"
+        );
+        self.config.dims = Some(dims);
+        self
     }
 
     /// Set the model's query/document prefixes (see [`Prefixes`]). Defaults to
@@ -876,19 +884,9 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "below minimum")]
     fn rejects_dims_below_minimum() {
-        let error = EmbeddingApi::new(
-            "https://example.test/v1/openai",
-            "secret",
-            "Qwen/Qwen3-Embedding-8B",
-            Some(16),
-            ConcurrencyLimits::default(),
-        )
-        .expect_err("must reject");
-        assert!(
-            format!("{error:#}").contains("below minimum"),
-            "error: {error:#}"
-        );
+        let _api = client(FakeTransport::new(vec![])).with_mrl_truncation(16);
     }
 
     #[tokio::test]
@@ -963,14 +961,17 @@ mod tests {
     /// Client for the live integration test: only the API key comes from the env.
     fn live_client(dims: Option<usize>) -> EmbeddingApi {
         let api_key = std::env::var("EMBED_API_KEY").expect("EMBED_API_KEY set");
-        EmbeddingApi::new(
+        let api = EmbeddingApi::new(
             "https://api.deepinfra.com/v1/openai",
             api_key,
             "Qwen/Qwen3-Embedding-8B",
-            dims,
             ConcurrencyLimits::default(),
         )
-        .expect("build EmbeddingApi")
+        .expect("build EmbeddingApi");
+        match dims {
+            Some(n) => api.with_mrl_truncation(n),
+            None => api,
+        }
     }
 
     #[tokio::test]

@@ -123,9 +123,9 @@ let api = EmbeddingApi::new(
     "https://api.deepinfra.com/v1/openai",
     api_key,
     "Qwen/Qwen3-Embedding-8B",
-    Some(512),                    // MRL truncation; None = model native dims
     ConcurrencyLimits::default(), // process-wide concurrency cap + per-call timeout
 )?
+.with_mrl_truncation(512)           // optional; default = model native dims
 .with_prefixes(&prefixes)           // optional; model config, shared with `embed`
 .with_max_tokens(32_768)            // model ctx window (card): https://huggingface.co/Qwen/Qwen3-Embedding-8B
                                     // — read "Context Length" from the card; for chunking
@@ -144,9 +144,10 @@ let rows = api.embed_documents(&["first text", "second text"], &opts).await?;
 ```
 
 Notes:
-- `dims = None` omits the `dimensions` field (non-MRL models / native output);
-  `dims = Some(n)` requires `n >= 32` and requests MRL truncation. Truncated
-  vectors are **not** renormalized — normalize downstream if you need unit length.
+- `.with_mrl_truncation(n)` requests MRL truncation to `n` dims (`n >= 32`);
+  without it the vector uses the model's native output dimensions. The
+  `dimensions` field is omitted when unset. Truncated vectors are **not**
+  renormalized — normalize downstream if you need unit length.
 - Inputs are split into batches and issued with bounded concurrency; results
   come back in input order. Retries cover 429/5xx/timeouts; other 4xx fail fast.
 - `embed_query` embeds **one** query (never chunked); `embed_documents` chunks

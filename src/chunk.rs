@@ -5,6 +5,8 @@
 //! Lives outside `embed` (feature-gated) so the remote client reuses it;
 //! re-exported as `patterns::embed::*` for back-compat.
 
+use std::num::NonZeroUsize;
+
 use anyhow::Result;
 use tokenizers::Tokenizer;
 
@@ -24,6 +26,9 @@ pub struct ChunkOptions {
     pub overlap_tokens: usize,
     /// Texts below this token count are not worth embedding.
     pub min_tokens: usize,
+    /// Cap on chunks emitted per document. `None` = no cap; `Some(1)` keeps
+    /// only the first window.
+    pub max_chunks: Option<NonZeroUsize>,
 }
 
 impl ChunkOptions {
@@ -34,6 +39,7 @@ impl ChunkOptions {
             max_tokens,
             overlap_tokens: 64,
             min_tokens: 5,
+            max_chunks: None,
         }
     }
 }
@@ -101,15 +107,17 @@ pub(crate) fn fake_token_spans(text: &str) -> Vec<TokenSpan> {
 ///
 /// Invariant: every non-whitespace byte of `text` is inside exactly one chunk
 /// span's coverage (no tail loss); consecutive chunks overlap by at most
-/// `opts.overlap_tokens`.
+/// `opts.overlap_tokens`. `opts.max_chunks` caps the chunks emitted per text,
+/// so a capped call may drop the tail (no loss only when uncapped).
 pub(crate) fn chunk_spans(text: &str, spans: &[TokenSpan], opts: &ChunkOptions) -> Vec<TextChunk> {
     let max = opts.max_tokens.max(1);
+    let max_chunks = opts.max_chunks.map_or(usize::MAX, NonZeroUsize::get);
     let mut out = Vec::new();
     if spans.is_empty() {
         return out;
     }
     let mut start = 0_usize;
-    while start < spans.len() {
+    while start < spans.len() && out.len() < max_chunks {
         let remaining = spans.len() - start;
         if remaining <= max {
             if let Some(chunk) = make_chunk(text, spans, start, spans.len()) {

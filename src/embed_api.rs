@@ -681,6 +681,7 @@ mod tests {
             max_tokens: 16,
             overlap_tokens: 0,
             min_tokens: 1,
+            max_chunks: None,
         };
         let rows = api
             .embed_documents(&["hello world"], &opts)
@@ -712,6 +713,7 @@ mod tests {
             max_tokens: 1,
             overlap_tokens: 0,
             min_tokens: 2,
+            max_chunks: None,
         };
 
         // doc0 "hello world" (2 tokens) -> two 1-token chunks; doc1 "hello"
@@ -729,6 +731,40 @@ mod tests {
         assert_eq!((second.doc_ix, second.chunk_ix), (0, 1));
         assert_eq!(first.chunk.text, "hello");
         assert_eq!(second.chunk.text, "world");
+    }
+
+    #[tokio::test]
+    async fn max_chunks_caps_document_chunks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tokenizer.json");
+        std::fs::write(&path, WORDLEVEL_TOKENIZER).expect("write tokenizer");
+        let transport = FakeTransport::new(vec![ok(response_body(&[(0, vec![0.5])]))]);
+        let api = client(transport.clone()).with_tokenizer(path.to_str().expect("utf8 path"));
+        let opts = ChunkOptions {
+            max_tokens: 1,
+            overlap_tokens: 0,
+            min_tokens: 1,
+            max_chunks: std::num::NonZeroUsize::new(1),
+        };
+
+        // "hello world" would otherwise split into two 1-token chunks; the cap
+        // keeps only the first window, and only that one is sent upstream.
+        let rows = api
+            .embed_documents(&["hello world"], &opts)
+            .await
+            .expect("documents");
+
+        assert_eq!(rows.len(), 1);
+        let first = rows.first().expect("first row");
+        assert_eq!((first.doc_ix, first.chunk_ix), (0, 0));
+        assert_eq!(first.chunk.text, "hello");
+        let input = transport
+            .last_request()
+            .body
+            .get("input")
+            .cloned()
+            .expect("input field");
+        assert_eq!(input, json!(["hello"]), "only the first chunk goes out");
     }
 
     #[test]
@@ -1027,6 +1063,7 @@ mod tests {
             max_tokens: 64,
             overlap_tokens: 8,
             min_tokens: 10,
+            max_chunks: None,
         };
         let rows = api
             .embed_documents(&docs, &opts)

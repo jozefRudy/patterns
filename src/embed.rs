@@ -515,6 +515,7 @@ mod tests {
             max_tokens: 3,
             overlap_tokens: 1,
             min_tokens: 1,
+            max_chunks: None,
         };
         let chunks = fake_chunks(text, &opts);
         assert!(chunks.len() > 1, "long text must split");
@@ -538,6 +539,7 @@ mod tests {
             max_tokens: 3,
             overlap_tokens: 0,
             min_tokens: 1,
+            max_chunks: None,
         };
         let chunks = fake_chunks(text, &opts);
         assert_eq!(
@@ -554,10 +556,34 @@ mod tests {
             max_tokens: 1,
             overlap_tokens: 64,
             min_tokens: 1,
+            max_chunks: None,
         };
         let chunks = fake_chunks(text, &opts);
         assert_eq!(chunks.len(), 5, "one chunk per token, no stalls");
         assert!(chunks.windows(2).all(|w| w[0].byte_start < w[1].byte_start));
+    }
+
+    #[test]
+    fn max_chunks_caps_emitted_chunks() {
+        let text = "w0 w1 w2 w3 w4 w5 w6 w7 w8 w9";
+        let base = ChunkOptions {
+            max_tokens: 3,
+            overlap_tokens: 0,
+            min_tokens: 1,
+            max_chunks: None,
+        };
+        let uncapped = fake_chunks(text, &base);
+        assert!(uncapped.len() > 1, "long text must split when uncapped");
+
+        let capped = fake_chunks(
+            text,
+            &ChunkOptions {
+                max_chunks: std::num::NonZeroUsize::new(1),
+                ..base
+            },
+        );
+        assert_eq!(capped.len(), 1, "cap keeps only the first window");
+        assert_eq!(capped[0].text, uncapped[0].text);
     }
 
     #[tokio::test]
@@ -610,6 +636,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn batch_respects_max_chunks_per_document() {
+        let e = Embedder::fake(8);
+        let mut opts = ChunkOptions::new(3);
+        opts.min_tokens = 1;
+        opts.overlap_tokens = 0;
+        opts.max_chunks = std::num::NonZeroUsize::new(1);
+        let texts = vec![
+            "w0 w1 w2 w3 w4 w5 w6 w7 w8 w9".to_string(),
+            "x0 x1 x2 x3 x4 x5".to_string(),
+        ];
+        let out = e
+            .embed_batch_document_chunks(&texts, &opts)
+            .await
+            .expect("batch");
+        // exactly one row per doc, nothing beyond the first window
+        assert_eq!(out.len(), 2, "one chunk per document");
+        assert!(out.iter().all(|c| c.chunk_ix == 0));
+        assert_eq!(out.iter().map(|c| c.doc_ix).collect::<Vec<_>>(), vec![0, 1]);
+    }
+
+    #[tokio::test]
     async fn document_prefix_is_applied_to_every_chunk() {
         let prefixes = Prefixes::new("search_query: ", "search_document: ");
         let e = Embedder::fake_with_prefixes(8, &prefixes);
@@ -617,6 +664,7 @@ mod tests {
             max_tokens: 3,
             overlap_tokens: 0,
             min_tokens: 1,
+            max_chunks: None,
         };
         let chunks = e
             .embed_batch_document_chunks(&["aa bb cc dd ee"], &opts)
@@ -795,6 +843,7 @@ mod tests {
             max_tokens: 200,
             overlap_tokens: 32,
             min_tokens: 1,
+            max_chunks: None,
         };
         let chunks = e.chunk(text, &opts).expect("tokenizer-exact chunking");
         assert!(chunks.len() >= 5, "1200 tokens / 200 = 6 chunks");

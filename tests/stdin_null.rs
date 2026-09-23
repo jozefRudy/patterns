@@ -20,7 +20,9 @@ struct Dummy {
 }
 
 impl Extractable for Dummy {
-    const HEALTHCHECK_TEXT: &'static str = "healthcheck";
+    fn healthcheck_text() -> anyhow::Result<String> {
+        Ok("healthcheck".to_owned())
+    }
 
     fn render_prompt(schema: &str, text: &str, _ctx: &str) -> anyhow::Result<String> {
         Ok(format!("{schema}\n{text}"))

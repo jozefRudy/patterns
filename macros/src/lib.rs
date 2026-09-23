@@ -4,16 +4,16 @@
 //! The consumer struct is the source of truth (mirroring
 //! `#[derive(JsonSchema)]` + `#[schemars(description)]` in `llm_cli`): field
 //! attributes declare each question, container attributes bind the state
-//! template and the optional healthcheck fixture. The derive emits the askama
-//! input template struct, `impl Questions` (`questions()` + `render_state`),
-//! and — when `healthcheck` is present — `impl Evaluatable` (forwarding
-//! `verify` to your inherent method of that name).
+//! template and the healthcheck fixture. The derive emits the askama input
+//! template struct, `impl Questions` (`questions()` + `render_state`), and
+//! `impl Evaluatable` (forwarding `verify` to your inherent method of that
+//! name).
 //!
 //! ```ignore
 //! #[derive(SystemOne, Debug, serde::Deserialize)]
 //! #[systemone(
 //!     template = "prompts/job_input.md",
-//!     healthcheck = "Senior Rust dev, fully remote, EUR 80k-100k",
+//!     healthcheck = "prompts/job_healthcheck.md",
 //! )]
 //! struct JobAssessment {
 //!     #[noul("Is the role fully remote, with no onsite or region restriction?")]
@@ -41,7 +41,7 @@ mod common;
 
 use common::{healthcheck_methods, parse_container, render_fn};
 
-/// Derive `Questions` (and optionally `Evaluatable`) for an annotated struct.
+/// Derive `Questions` and `Evaluatable` for an annotated struct.
 #[proc_macro_derive(SystemOne, attributes(systemone, noul, choice, score))]
 pub fn derive_systemone(input: TokenStream) -> TokenStream {
     let input = syn::parse_macro_input!(input as DeriveInput);
@@ -55,9 +55,9 @@ pub fn derive_systemone(input: TokenStream) -> TokenStream {
 //   #[proc_macro_derive(Extractable, attributes(extract))]
 //   pub fn derive_extractable(input: TokenStream) -> TokenStream { ... }
 //
-// Container attr: `#[extract(template = "...", healthcheck = "...")]` — same
+// MANDATORY: `#[extract(template = "...", healthcheck = "...")]` — same
 // keys as `#[systemone(...)]`, so reuse `parse_container` (already generic).
-// `healthcheck` is required here (Extractable::HEALTHCHECK_TEXT has no default).
+// `healthcheck` is required (Extractable::healthcheck_text has no default).
 //
 // Emits (replaces `define_prompts!` + a hand-written `Extractable` impl):
 //   #[derive(::patterns::askama::Template)]
@@ -65,7 +65,7 @@ pub fn derive_systemone(input: TokenStream) -> TokenStream {
 //   struct <Name>Prompt<'a> { schema: &'a str, text: &'a str, prompt_context: &'a str }
 //
 //   impl ::patterns::llm_cli::Extractable for <Name> {
-//       const HEALTHCHECK_TEXT: &'static str = <healthcheck literal>;
+//       fn healthcheck_text() -> anyhow::Result<String>
 //       fn render_prompt(schema, text, prompt_context) -> anyhow::Result<String>
 //       fn verify(&self) -> anyhow::Result<()> { Self::verify(self) }  // inherent
 //   }
@@ -103,12 +103,6 @@ fn expand_extractable(input: &DeriveInput) -> Result<proc_macro2::TokenStream> {
             )
         })?;
     let container = parse_container(container_attr)?;
-    let healthcheck = container.healthcheck.as_ref().ok_or_else(|| {
-        Error::new(
-            container_attr.span(),
-            "missing `healthcheck = \"...\"` (Extractable::HEALTHCHECK_TEXT has no default)",
-        )
-    })?;
 
     let name = &input.ident;
     let template = &container.template;
@@ -117,7 +111,7 @@ fn expand_extractable(input: &DeriveInput) -> Result<proc_macro2::TokenStream> {
         template,
         &["schema", "text", "prompt_context"],
     );
-    let methods = healthcheck_methods(healthcheck);
+    let methods = healthcheck_methods(&container.healthcheck);
 
     Ok(quote! {
         impl ::patterns::llm_cli::Extractable for #name {
@@ -402,14 +396,14 @@ fn expand(input: &DeriveInput) -> Result<proc_macro2::TokenStream> {
         &["text", "prompt_context"],
     );
 
-    let healthcheck_impl = container.healthcheck.as_ref().map(|fixture| {
-        let methods = healthcheck_methods(fixture);
+    let healthcheck_impl = {
+        let methods = healthcheck_methods(&container.healthcheck);
         quote! {
             impl ::patterns::systemone::Evaluatable for #name {
                 #methods
             }
         }
-    });
+    };
 
     Ok(quote! {
         impl ::patterns::systemone::Questions for #name {
@@ -481,7 +475,7 @@ mod tests {
     #[test]
     fn systemone_rejects_generics() {
         let input: DeriveInput = syn::parse_quote! {
-            #[systemone(template = "t.md")]
+            #[systemone(template = "t.md", healthcheck = "hc.md")]
             struct Probe<T> { #[noul("q")] a: Noul }
         };
         let err = expand(&input).expect_err("must fail");
@@ -494,7 +488,7 @@ mod tests {
     #[test]
     fn systemone_rejects_tuple_struct() {
         let input: DeriveInput = syn::parse_quote! {
-            #[systemone(template = "t.md")]
+            #[systemone(template = "t.md", healthcheck = "hc.md")]
             struct Probe(Noul);
         };
         let err = expand(&input).expect_err("must fail");
@@ -504,7 +498,7 @@ mod tests {
     #[test]
     fn systemone_rejects_empty_struct() {
         let input: DeriveInput = syn::parse_quote! {
-            #[systemone(template = "t.md")]
+            #[systemone(template = "t.md", healthcheck = "hc.md")]
             struct Probe {}
         };
         let err = expand(&input).expect_err("must fail");
@@ -523,7 +517,7 @@ mod tests {
     #[test]
     fn systemone_expands_valid() {
         let input: DeriveInput = syn::parse_quote! {
-            #[systemone(template = "t.md", healthcheck = "hc")]
+            #[systemone(template = "t.md", healthcheck = "hc.md")]
             struct Probe { #[noul("q")] a: Noul }
         };
         let tokens = expand(&input).expect("expand").to_string();
@@ -544,7 +538,7 @@ mod tests {
     #[test]
     fn extractable_rejects_enum() {
         let input: DeriveInput = syn::parse_quote! {
-            #[extract(template = "t.md", healthcheck = "hc")]
+            #[extract(template = "t.md", healthcheck = "hc.md")]
             enum Probe { A }
         };
         let err = expand_extractable(&input).expect_err("must fail");
@@ -554,11 +548,11 @@ mod tests {
     #[test]
     fn extractable_expands_valid() {
         let input: DeriveInput = syn::parse_quote! {
-            #[extract(template = "t.md", healthcheck = "hc")]
+            #[extract(template = "t.md", healthcheck = "hc.md")]
             struct Probe { value: String }
         };
         let tokens = expand_extractable(&input).expect("expand").to_string();
         assert!(tokens.contains("Extractable"));
-        assert!(tokens.contains("HEALTHCHECK_TEXT"));
+        assert!(tokens.contains("healthcheck_text"));
     }
 }

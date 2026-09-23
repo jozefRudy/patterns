@@ -9,7 +9,7 @@ use syn::{Error, Expr, Ident, Lit, LitStr, Meta, Result, Token};
 #[derive(Debug)]
 pub struct Container {
     pub template: LitStr,
-    pub healthcheck: Option<LitStr>,
+    pub healthcheck: LitStr,
 }
 
 pub fn parse_container(attr: &syn::Attribute) -> Result<Container> {
@@ -50,6 +50,8 @@ pub fn parse_container(attr: &syn::Attribute) -> Result<Container> {
     }
     let template =
         template.ok_or_else(|| Error::new(attr.span(), "missing `template = \"...\"`"))?;
+    let healthcheck =
+        healthcheck.ok_or_else(|| Error::new(attr.span(), "missing `healthcheck = \"...\"`"))?;
     Ok(Container {
         template,
         healthcheck,
@@ -80,11 +82,21 @@ pub fn render_fn(fn_name: &Ident, template: &LitStr, params: &[&str]) -> TokenSt
     }
 }
 
-/// Emit the `HEALTHCHECK_TEXT` const + `verify` forwarding used by both
-/// `Evaluatable` and `Extractable` healthcheck impls.
+/// Emit `healthcheck_text` (renders the fixture through askama, so its path
+/// resolves from the same configured dirs as `template`) + `verify` forwarding
+/// used by both `Evaluatable` and `Extractable` healthcheck impls.
 pub fn healthcheck_methods(healthcheck: &LitStr) -> TokenStream {
     quote! {
-        const HEALTHCHECK_TEXT: &'static str = #healthcheck;
+        fn healthcheck_text() -> ::anyhow::Result<::std::string::String> {
+            #[derive(::patterns::askama::Template)]
+            #[template(path = #healthcheck, ext = "md", askama = ::patterns::askama)]
+            struct Healthcheck;
+
+            use ::patterns::askama::Template as _;
+            Healthcheck
+                .render()
+                .map_err(::core::convert::Into::into)
+        }
 
         fn verify(&self) -> ::anyhow::Result<()> {
             Self::verify(self)
@@ -108,25 +120,22 @@ mod tests {
 
     #[test]
     fn parses_template_and_healthcheck() {
-        let attr = attr(quote! { #[systemone(template = "t.md", healthcheck = "hc")] });
+        let attr = attr(quote! { #[systemone(template = "t.md", healthcheck = "hc.md")] });
         let container = parse_container(&attr).expect("valid");
         assert_eq!(container.template.value(), "t.md");
-        assert_eq!(
-            container.healthcheck.as_ref().map(syn::LitStr::value),
-            Some("hc".to_owned())
-        );
+        assert_eq!(container.healthcheck.value(), "hc.md");
     }
 
     #[test]
-    fn healthcheck_is_optional() {
+    fn rejects_missing_healthcheck() {
         let attr = attr(quote! { #[systemone(template = "t.md")] });
-        let container = parse_container(&attr).expect("valid");
-        assert!(container.healthcheck.is_none());
+        let err = parse_container(&attr).expect_err("must fail");
+        assert!(err.to_string().contains("missing `healthcheck"), "{err}");
     }
 
     #[test]
     fn rejects_missing_template() {
-        let attr = attr(quote! { #[systemone(healthcheck = "hc")] });
+        let attr = attr(quote! { #[systemone(healthcheck = "hc.md")] });
         let err = parse_container(&attr).expect_err("must fail");
         assert!(err.to_string().contains("missing `template"), "{err}");
     }
@@ -153,10 +162,11 @@ mod tests {
     }
 
     #[test]
-    fn healthcheck_methods_emit_const_and_verify() {
-        let healthcheck: LitStr = syn::parse_quote!("hc");
+    fn healthcheck_methods_emit_render_and_verify() {
+        let healthcheck: LitStr = syn::parse_quote!("hc.md");
         let tokens = healthcheck_methods(&healthcheck).to_string();
-        assert!(tokens.contains("HEALTHCHECK_TEXT"));
+        assert!(tokens.contains("healthcheck_text"));
+        assert!(tokens.contains("askama"));
         assert!(tokens.contains("fn verify"));
     }
 

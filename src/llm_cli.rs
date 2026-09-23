@@ -27,8 +27,8 @@ pub const DEFAULT_MAX_TEXT_LEN: usize = 4000;
 /// Implementations render their own prompt (e.g. via an askama template and a
 /// project-local prompt-kind enum) so this crate stays template-agnostic.
 pub trait Extractable: JsonSchema + for<'de> Deserialize<'de> {
-    /// Sample text used to verify the LLM produces valid structured output.
-    const HEALTHCHECK_TEXT: &'static str;
+    /// Fixture text used to verify the LLM produces valid structured output.
+    fn healthcheck_text() -> Result<String>;
 
     /// Render the extraction prompt from the JSON schema, the (already
     /// truncated) input text, and optional dynamic prompt context.
@@ -256,14 +256,15 @@ impl SharedLlm {
             .await
     }
 
-    /// Healthcheck: extract from `T::HEALTHCHECK_TEXT` and validate via
+    /// Healthcheck: extract from `T::healthcheck_text` and validate via
     /// `T::verify`. Cheap enough to run once per batch (not per item);
     /// catches broken bin/auth/model drift before a whole pass burns.
     ///
     /// # Errors
     /// On any extraction or validation failure.
     pub async fn verify<T: Extractable + Send>(&self) -> Result<()> {
-        self.extract::<T>(T::HEALTHCHECK_TEXT, "healthcheck".to_owned())
+        let text = T::healthcheck_text()?;
+        self.extract::<T>(&text, "healthcheck".to_owned())
             .await?
             .verify()
     }
@@ -322,7 +323,9 @@ struct Dummy {
 
 #[cfg(test)]
 impl Extractable for Dummy {
-    const HEALTHCHECK_TEXT: &'static str = "hello";
+    fn healthcheck_text() -> Result<String> {
+        Ok("hello".to_owned())
+    }
 
     fn render_prompt(_schema: &str, _text: &str, _ctx: &str) -> Result<String> {
         Ok("prompt".to_string())
@@ -468,7 +471,9 @@ if [ "$c" -eq 0 ]; then echo 'not json'; else echo '{"value":"fixed"}'; fi
     }
 
     impl Extractable for Echo {
-        const HEALTHCHECK_TEXT: &'static str = "hi";
+        fn healthcheck_text() -> Result<String> {
+            Ok("hi".to_owned())
+        }
 
         fn render_prompt(_schema: &str, text: &str, _ctx: &str) -> Result<String> {
             Ok(serde_json::to_string(&Self {

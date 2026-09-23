@@ -232,7 +232,7 @@ struct RawResponse {
 /// shape and call [`SharedSystemOne::verify`] before a batch.
 pub trait Evaluatable: Questions + for<'de> Deserialize<'de> {
     /// Fixture text rendered through the real template for the batch gate.
-    const HEALTHCHECK_TEXT: &'static str;
+    fn healthcheck_text() -> Result<String>;
     /// Validate the parsed healthcheck answers.
     fn verify(&self) -> Result<()>;
 }
@@ -379,12 +379,13 @@ impl SharedSystemOne {
 
     /// Domain-aware healthcheck, mirroring [`crate::llm_cli::SharedLlm::verify`].
     ///
-    /// Renders `E::HEALTHCHECK_TEXT` through `E`'s real template, evaluates
+    /// Renders `E::healthcheck_text` through `E`'s real template, evaluates
     /// `E`'s real questions, and validates the result via [`Evaluatable::verify`].
     /// Cheap enough to run once per batch (not per item); catches broken
     /// auth/model/template/shape drift before a whole pass burns.
     pub async fn verify<E: Evaluatable>(&self) -> Result<()> {
-        let state = E::render_state(E::HEALTHCHECK_TEXT, "healthcheck")?;
+        let text = E::healthcheck_text()?;
+        let state = E::render_state(&text, "healthcheck")?;
         self.evaluate_map::<E>(&serde_json::json!(state), &E::questions())
             .await?
             .verify()
@@ -552,7 +553,7 @@ mod tests {
     }
 
     #[derive(SystemOne, Debug, serde::Deserialize)]
-    #[systemone(template = "test_input.md", healthcheck = "Healthcheck text.")]
+    #[systemone(template = "test_input.md", healthcheck = "test_healthcheck.md")]
     pub struct NoulOut {
         #[noul("Is it urgent?")]
         pub urgency: Noul,
@@ -570,7 +571,7 @@ mod tests {
     }
 
     #[derive(SystemOne, Debug, serde::Deserialize)]
-    #[systemone(template = "test_input.md")]
+    #[systemone(template = "test_input.md", healthcheck = "test_healthcheck.md")]
     pub struct Mixed {
         #[noul("Urgent?")]
         is_urgent: Noul,
@@ -578,6 +579,13 @@ mod tests {
         severity: Score,
         #[choice("Team?", billing, other = "none of these")]
         team: Choice,
+    }
+
+    impl Mixed {
+        fn verify(&self) -> Result<()> {
+            anyhow::ensure!(self.is_urgent.noul <= 1.0, "noul out of range");
+            Ok(())
+        }
     }
 
     fn client(transport: Arc<dyn Transport>) -> SharedSystemOne {

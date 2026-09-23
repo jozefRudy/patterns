@@ -1,12 +1,13 @@
 //! Consumer-style check that `#[derive(Extractable)]` works from outside the
 //! crate: the askama prompt template compiles, `render_prompt` substitutes all
-//! three slots, and `healthcheck` populates `HEALTHCHECK_TEXT`.
+//! three slots, and `healthcheck` renders the fixture into
+//! `healthcheck_text`.
 
 use patterns::Extractable;
 use patterns::llm_cli::Extractable as _;
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema, Extractable)]
-#[extract(template = "test_fields.md", healthcheck = "Healthcheck text.")]
+#[extract(template = "test_fields.md", healthcheck = "test_healthcheck.md")]
 struct Test {
     value: String,
 }
@@ -28,5 +29,8 @@ fn derive_renders_prompt_with_all_slots() {
 
 #[test]
 fn derive_exposes_healthcheck_text() {
-    assert_eq!(Test::HEALTHCHECK_TEXT, "Healthcheck text.");
+    assert_eq!(
+        Test::healthcheck_text().expect("render").trim(),
+        "Healthcheck text."
+    );
 }

@@ -1,13 +1,13 @@
 //! Consumer-style check that `#[derive(SystemOne)]` works from outside the
 //! crate: the askama input template compiles and `render_state` substitutes
-//! both fields; `questions()` builds the typed map; the healthcheck forwards
-//! to the inherent `verify`.
+//! both fields; `questions()` builds the typed map; the healthcheck template
+//! forwards to the inherent `verify`.
 
 use patterns::SystemOne;
 use patterns::systemone::{Choice, Noul, Questions, Score};
 
 #[derive(SystemOne, Debug, serde::Deserialize)]
-#[systemone(template = "test_input.md", healthcheck = "Healthcheck text.")]
+#[systemone(template = "test_input.md", healthcheck = "test_healthcheck.md")]
 struct Test {
     #[noul("Is it urgent?")]
     urgent: Noul,

@@ -25,8 +25,8 @@ Modules (feature-gated; `default = ["llm_cli", "embed", "embed_api", "language",
   per-call timeout and a configurable `RetryPolicy` (default 3 attempts,
   250ms→2s) for transient failures. Base URL/API key/model come from the caller
   (never read from env); backends differ only by base URL. Questions are
-  independent; `#[derive(SystemOne)]` generates the typed question set and,
-  with `healthcheck = "…"`, the batch-gate `Evaluatable` impl.
+  independent; `#[derive(SystemOne)]` generates the typed question set and
+  the batch-gate `Evaluatable` impl.
 - `embed_api` (feature `embed_api`) — bounded HTTP client for any
   OpenAI-compatible `/embeddings` endpoint (DeepInfra, OpenAI, Together,
   SiliconFlow), via `EmbeddingApi`: a cloneable handle with a process-wide
@@ -242,7 +242,7 @@ use patterns::Extractable;
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema, Extractable)]
 #[extract(
     template = "prompts/job_ad.md",
-    healthcheck = "Senior Rust dev, fully remote, EUR 80k-100k",
+    healthcheck = "prompts/job_ad_healthcheck.md",
 )]
 struct JobAd {
     #[schemars(description = "job title or role; if multiple listed, join them with ' + '")]
@@ -263,8 +263,9 @@ struct JobAd {
 - `#[extract(template = "...")]` — the strongly typed askama template; exactly
   `{{ schema }}`, `{{ text }}`, `{{ prompt_context }}` are available (anything
   else is a compile error). `render_prompt` is generated from it.
-- `#[extract(healthcheck = "...")]` — the fixture; generates
-  `HEALTHCHECK_TEXT`.
+- `#[extract(healthcheck = "...")]` — path to the markdown fixture, resolved
+  by askama from the same configured dirs as `template` (no placeholders, so it
+  renders to its literal content); generates `healthcheck_text`.
 
 `templates/prompts/job_ad.md`:
 
@@ -313,7 +314,7 @@ trigger the repair retry below. You never touch untyped JSON yourself.
 ## Healthcheck as a batch gate
 
 `SharedLlm::verify::<T>()` runs the **whole pipeline** (prompt → subprocess →
-parse) on `T::HEALTHCHECK_TEXT` — a fixture with a known-correct answer —
+parse) on `T::healthcheck_text()` — a fixture with a known-correct answer —
 and asserts `T::verify()` on the result. It validates the *system*, not the
 data: prompt wording regressions, model swaps/fallbacks, JSON-mode breakage,
 parse drift, auth degradation.
@@ -359,7 +360,8 @@ same role `#[derive(JsonSchema)]` + `#[schemars(description)]` play for
 "...")]` binds the input template (askama, `{{ text }}` + `{{ prompt_context }}`
 only); the derive emits `questions()` + `render_state`, so the questions and
 the template cannot drift apart. `#[systemone(healthcheck = "...")]`
-additionally emits the batch-gate `Evaluatable` impl.
+(the required path to the fixture markdown) emits the batch-gate `Evaluatable`
+impl.
 
 ```rust
 use patterns::SystemOne;
@@ -377,7 +379,7 @@ let client = SharedSystemOne::new(
 #[derive(SystemOne, Debug, serde::Deserialize)]
 #[systemone(
     template = "job_input.md",
-    healthcheck = "Senior Rust dev, fully remote, EUR 80k-100k",
+    healthcheck = "job_healthcheck.md",
 )]
 struct JobAssessment {
     #[noul("Is the role fully remote, with no onsite or region restriction? Judge only from the job posting in the input.")]

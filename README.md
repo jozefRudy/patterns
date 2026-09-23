@@ -114,8 +114,9 @@ use patterns::embed_api::EmbeddingApi;
 use patterns::limits::ConcurrencyLimits;
 use patterns::prefixes::Prefixes;
 
-let prefixes = Prefixes::query_only(
+let prefixes = Prefixes::new(
     "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:",
+    "", // documents are embedded raw
 );
 
 let api = EmbeddingApi::new(

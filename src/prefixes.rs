@@ -24,21 +24,13 @@ impl Prefixes {
         }
     }
 
-    /// Explicit query and document prefixes.
+    /// Explicit query and document prefixes (documents raw = `""`, e.g.
+    /// Qwen3-Embedding).
     #[must_use]
     pub fn new(query: impl Into<String>, document: impl Into<String>) -> Self {
         Self {
             query: query.into(),
             document: document.into(),
-        }
-    }
-
-    /// Query prefix only; documents are embedded raw (e.g. Qwen3-Embedding).
-    #[must_use]
-    pub fn query_only(query: impl Into<String>) -> Self {
-        Self {
-            query: query.into(),
-            document: String::new(),
         }
     }
 }

@@ -651,7 +651,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tokenizer.json");
         std::fs::write(&path, WORDLEVEL_TOKENIZER).expect("write tokenizer");
-        let prefixes = Prefixes::query_only("Instruct: retrieve\nQuery:");
+        let prefixes = Prefixes::new("Instruct: retrieve\nQuery:", "");
         let transport = FakeTransport::new(vec![
             ok(response_body(&[(0, vec![1.0])])),
             ok(response_body(&[(0, vec![2.0])])),

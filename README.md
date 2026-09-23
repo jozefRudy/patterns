@@ -115,7 +115,7 @@ use patterns::limits::ConcurrencyLimits;
 use patterns::prefixes::Prefixes;
 
 let prefixes = Prefixes::query_only(
-    "Instruct: Given a web search query, retrieve relevant passages\nQuery: ",
+    "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:",
 );
 
 let api = EmbeddingApi::new(
@@ -168,7 +168,12 @@ Notes:
   chunk. Defaults to none (symmetric models). `Prefixes`
   lives in `patterns::prefixes` (re-exported as `patterns::embed::Prefixes`).
   For asymmetric open models this replaces a provider's native `input_type` —
-  e.g. Qwen3-Embedding's `Instruct: <task>\nQuery: ` query prefix.
+  e.g. Qwen3-Embedding's `Instruct: <task>\nQuery:` query prefix.
+- `.with_prefixes_from_hf(query_key, document_key).await?` fetches the two
+  prompts from the model's `config_sentence_transformers.json` instead (requires
+  `.with_hf_home`). Keys vary by model (`query`/`document`,
+  `query`/`passage`, `retrieval.query`/`retrieval.passage`); it fails when the
+  file, `prompts` map, or a key is missing — not every repo ships this file.
 - Only the OpenAI-compatible schema is supported (DeepInfra, OpenAI, Together,
   SiliconFlow). Native Cohere/Voyage/Jina APIs are out of scope.
 

@@ -21,6 +21,7 @@ use crate::prefixes::Prefixes;
 use crate::retry::{HttpResponse, RetryPolicy};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -192,6 +193,41 @@ impl EmbeddingApi {
     pub fn with_prefixes(mut self, prefixes: &Prefixes) -> Self {
         self.config.prefixes = prefixes.clone();
         self
+    }
+
+    /// Fetch query/document prefixes from the model's Hugging Face
+    /// `config_sentence_transformers.json` (e.g. Qwen3-Embedding's
+    /// `Instruct: ...\nQuery:`), using the configured model as the repo id.
+    ///
+    /// `query_key`/`document_key` name the `prompts` entries to read — the keys
+    /// vary by model (`query`/`document`, `query`/`passage`,
+    /// `retrieval.query`/`retrieval.passage`). Requires
+    /// [`.with_hf_home`](Self::with_hf_home); fails when the file, its `prompts`
+    /// map, or either key is missing. Overrides any earlier [`Self::with_prefixes`].
+    pub async fn with_prefixes_from_hf(
+        self,
+        query_key: impl Into<String>,
+        document_key: impl Into<String>,
+    ) -> Result<Self> {
+        let repo = self.config.model.clone();
+        let hf_home = self.hf_home.clone();
+        let query_key = query_key.into();
+        let document_key = document_key.into();
+        let prefixes = tokio::task::spawn_blocking(move || {
+            let path = get_repo_file(
+                &repo,
+                "config_sentence_transformers.json",
+                hf_home.as_deref(),
+            )?;
+            let json = std::fs::read_to_string(&path)
+                .with_context(|| format!("read {}", path.display()))?;
+            extract_prefixes(&json, &query_key, &document_key)
+        })
+        .await
+        .context("join prefixes fetch")??;
+        let mut this = self;
+        this.config.prefixes = prefixes;
+        Ok(this)
     }
 
     /// Declare the model's context window in tokens (read from the model card).
@@ -443,18 +479,47 @@ async fn load_tokenizer(source: &str, hf_home: Option<&Path>) -> Result<Tokenize
     Ok(tokenizer)
 }
 
-/// Download only `tokenizer.json` from an HF repo (cached under `{hf_home}/hub`).
-fn load_hf_tokenizer(repo: &str, hf_home: Option<&Path>) -> Result<Tokenizer> {
+/// Download one file from an HF repo (cached under `{hf_home}/hub`).
+fn get_repo_file(repo: &str, filename: &str, hf_home: Option<&Path>) -> Result<PathBuf> {
     let home = hf_home.context("hf_home not configured (call .with_hf_home)")?;
     let api = hf_hub::api::sync::ApiBuilder::from_cache(hf_hub::Cache::new(home.join("hub")))
         .build()
         .context("init hf-hub api")?;
-    let path = api
-        .model(repo.to_owned())
-        .get("tokenizer.json")
-        .map_err(|e| anyhow::anyhow!("download tokenizer.json for {repo}: {e}"))?;
+    api.model(repo.to_owned())
+        .get(filename)
+        .map_err(|e| anyhow::anyhow!("download {filename} for {repo}: {e}"))
+}
+
+/// Download `tokenizer.json` from an HF repo (cached under `{hf_home}/hub`).
+fn load_hf_tokenizer(repo: &str, hf_home: Option<&Path>) -> Result<Tokenizer> {
+    let path = get_repo_file(repo, "tokenizer.json", hf_home)?;
     Tokenizer::from_file(&path)
         .map_err(|e| anyhow::anyhow!("load tokenizer from {}: {e}", path.display()))
+}
+
+/// The `prompts` map of a Hugging Face `config_sentence_transformers.json`.
+#[derive(Deserialize)]
+struct SentenceTransformersConfig {
+    #[serde(default)]
+    prompts: Option<HashMap<String, String>>,
+}
+
+/// Read two named prompt strings out of a `config_sentence_transformers.json`.
+fn extract_prefixes(json: &str, query_key: &str, document_key: &str) -> Result<Prefixes> {
+    let config: SentenceTransformersConfig =
+        serde_json::from_str(json).context("parse config_sentence_transformers.json")?;
+    let prompts = config
+        .prompts
+        .context("config_sentence_transformers.json has no `prompts` map")?;
+    let query = prompts
+        .get(query_key)
+        .with_context(|| format!("prompts has no key `{query_key}`"))?
+        .clone();
+    let document = prompts
+        .get(document_key)
+        .with_context(|| format!("prompts has no key `{document_key}`"))?
+        .clone();
+    Ok(Prefixes { query, document })
 }
 
 /// Parse a 2xx body, ordering vectors by `index` and validating the batch shape.
@@ -586,7 +651,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tokenizer.json");
         std::fs::write(&path, WORDLEVEL_TOKENIZER).expect("write tokenizer");
-        let prefixes = Prefixes::query_only("Instruct: retrieve\nQuery: ");
+        let prefixes = Prefixes::query_only("Instruct: retrieve\nQuery:");
         let transport = FakeTransport::new(vec![
             ok(response_body(&[(0, vec![1.0])])),
             ok(response_body(&[(0, vec![2.0])])),
@@ -602,7 +667,7 @@ mod tests {
             .get("input")
             .cloned()
             .expect("input field");
-        assert_eq!(query_input, json!(["Instruct: retrieve\nQuery: capital"]));
+        assert_eq!(query_input, json!(["Instruct: retrieve\nQuery:capital"]));
 
         let opts = ChunkOptions {
             max_tokens: 16,
@@ -670,6 +735,22 @@ mod tests {
             format!("{error:#}").contains("not configured"),
             "error: {error:#}"
         );
+    }
+
+    #[test]
+    fn extract_prefixes_reads_named_keys() {
+        let json = r#"{"prompts":{"query":"Q:","document":""}}"#;
+        let prefixes = extract_prefixes(json, "query", "document").expect("prefixes");
+        assert_eq!(prefixes.query, "Q:");
+        assert_eq!(prefixes.document, "");
+
+        let missing_key =
+            extract_prefixes(json, "query", "passage").expect_err("missing key errors");
+        assert!(format!("{missing_key:#}").contains("passage"));
+
+        let no_prompts = extract_prefixes(r#"{"default_prompt_name":null}"#, "query", "document")
+            .expect_err("absent prompts errors");
+        assert!(format!("{no_prompts:#}").contains("prompts"));
     }
 
     #[tokio::test]
@@ -921,6 +1002,17 @@ mod tests {
         assert_eq!(
             api.default_chunk_options().expect("opts").max_tokens,
             32_768 - crate::chunk::SPECIAL_TOKEN_HEADROOM
+        );
+
+        // Prefixes fetched from the model's config_sentence_transformers.json.
+        let with_prompts = live_client(Some(128))
+            .with_hf_home(cache.path())
+            .with_prefixes_from_hf("query", "document")
+            .await
+            .expect("prefixes from HF");
+        assert!(
+            format!("{with_prompts:?}").contains("Instruct: Given a web search query"),
+            "fetched query prompt: {with_prompts:?}"
         );
 
         // Full chunked-document round trip: a long doc splits into several rows,

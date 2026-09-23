@@ -3,7 +3,7 @@
 //! Shared by the in-process `embed` and remote `embed_api` backends so both
 //! apply the same formatting. The prefixes are **model configuration** — a
 //! fixed prepend chosen once per corpus (e.g. `"search_query: "` /
-//! `"search_document: "`, or Qwen's `"Instruct: <task>\nQuery: "` / `""`).
+//! `"search_document: "`, or Qwen's `"Instruct: <task>\nQuery:"` / `""`).
 
 /// Model's query/document prefixes (empty strings when the model uses none).
 #[derive(Clone, Debug)]

@@ -21,6 +21,7 @@ lingua = { version = "1.8.0", default-features = false, features = ["english", "
 # count-only tokenizer access (lock-free) — version pinned to fastembed's
 tokenizers = { version = "0.23", default-features = false, optional = true }
 hf-hub = { version = "0.5", default-features = false, optional = true }
+sha2 = { version = "0.11", optional = true }
 ort = { version = "=2.0.0-rc.13", optional = true, default-features = false }
 
 [features]
@@ -28,7 +29,15 @@ default = ["llm_cli", "embed", "embed_api", "language", "systemone"]
 templating = ["dep:askama"]
 derives = ["dep:patterns-macros"]
 llm_cli = ["templating", "derives", "dep:schemars"]
-embed = ["dep:fastembed", "dep:ort", "dep:tokenizers"]
+embed = [
+    "dep:fastembed",
+    "dep:ort",
+    "dep:tokenizers",
+    "dep:hf-hub",
+    "hf-hub/ureq",
+    "hf-hub/native-tls",
+    "dep:sha2",
+]
 embed_api = ["dep:reqwest", "dep:tokenizers", "tokenizers/fancy-regex", "dep:hf-hub", "hf-hub/ureq", "hf-hub/native-tls"]
 language = ["dep:lingua"]
 systemone = ["templating", "derives", "dep:reqwest"]

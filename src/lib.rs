@@ -25,10 +25,9 @@ pub mod retry;
 pub mod systemone;
 // Reserved: pub mod lance_store;
 
-/// Re-exported so embed consumers don't declare fastembed/ort separately
-/// (single version, enforced).
-#[cfg(feature = "embed")]
-pub use fastembed;
+/// Re-exported so consumers don't declare `ort` separately: it is the ONNX Runtime version (and
+/// linkage) that matters, and this keeps exactly one in the graph. `fastembed` is an internal
+/// implementation detail of `embed`.
 #[cfg(feature = "embed")]
 pub use ort;
 

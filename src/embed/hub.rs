@@ -32,7 +32,7 @@ pub(super) struct Artifact {
     pub(super) tokenizer_files: TokenizerFiles,
     pub(super) pooling_meta: Option<PoolingMeta>,
     pub(super) matryoshka_dims: Option<Vec<usize>>,
-    /// Tokenizer window, from `tokenizer_config.json`'s `model_max_length`.
+    /// Trained token window: tokenizer `model_max_length` clamped by the model's `max_position_embeddings`.
     pub(super) max_length: usize,
 }
 
@@ -220,22 +220,39 @@ pub(super) fn fetch<C: HubClient>(client: &C, spec: &ModelSpec) -> Result<Artifa
 
     Ok(Artifact {
         onnx,
-        max_length: parse_max_length(&tokenizer_files.tokenizer_config_file)?,
+        max_length: parse_max_length(
+            &tokenizer_files.tokenizer_config_file,
+            &tokenizer_files.config_file,
+        )?,
         matryoshka_dims: parse_matryoshka(&tokenizer_files.config_file)?,
         pooling_meta: read_pooling_meta(client, spec, &tree)?,
         tokenizer_files,
     })
 }
 
-/// `max_length` comes from the artifact, not from fastembed's private `DEFAULT_MAX_LENGTH`.
-fn parse_max_length(tokenizer_config: &[u8]) -> Result<usize> {
+/// Trained token window: tokenizer `model_max_length` clamped to the model's `max_position_embeddings`.
+///
+/// The tokenizer value is often a placeholder (e.g. `8192` without dynamic `RoPE` scaling, or `BGE`'s
+/// huge sentinel); the positional config is what the model actually trained on. `Fastembed`'s private
+/// `DEFAULT_MAX_LENGTH` is never consulted.
+fn parse_max_length(tokenizer_config: &[u8], model_config: &[u8]) -> Result<usize> {
     let config: serde_json::Value =
         serde_json::from_slice(tokenizer_config).context("parse tokenizer_config.json")?;
     let value = config
         .get("model_max_length")
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| anyhow!("tokenizer_config.json has no numeric `model_max_length`"))?;
-    usize::try_from(value).map_err(|err| anyhow!("model_max_length {value} is out of range: {err}"))
+    let tokenizer_max = usize::try_from(value)
+        .map_err(|err| anyhow!("model_max_length {value} is out of range: {err}"))?;
+
+    let model: serde_json::Value =
+        serde_json::from_slice(model_config).context("parse config.json")?;
+    let trained = model
+        .get("max_position_embeddings")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok());
+
+    Ok(trained.map_or(tokenizer_max, |trained| tokenizer_max.min(trained)))
 }
 
 /// MRL widths declared by the model, if any (`config.json`'s `matryoshka_dimensions`).
@@ -460,6 +477,50 @@ mod tests {
         assert_eq!(artifact.max_length, 512);
         assert_eq!(artifact.matryoshka_dims, Some(vec![256]));
         assert!(artifact.pooling_meta.is_none(), "no 1_Pooling/config.json");
+    }
+
+    #[test]
+    fn parse_max_length_clamps_to_trained_window() {
+        // tokenizer claims 8192 but the model was trained at 2048 (no dynamic RoPE scaling)
+        let got = parse_max_length(
+            br#"{"model_max_length":8192}"#,
+            br#"{"max_position_embeddings":2048}"#,
+        )
+        .expect("parse");
+        assert_eq!(got, 2048);
+
+        // absurd placeholder: the positional config wins
+        let got = parse_max_length(
+            br#"{"model_max_length":18446744073709551615}"#,
+            br#"{"max_position_embeddings":512}"#,
+        )
+        .expect("parse");
+        assert_eq!(got, 512);
+
+        // no positional field: trust the tokenizer
+        let got = parse_max_length(br#"{"model_max_length":512}"#, b"{}").expect("parse");
+        assert_eq!(got, 512);
+    }
+
+    #[test]
+    fn fetch_clamps_window_to_trained_positions() {
+        let hub = tokenizer_files(FakeHub {
+            hashed: true,
+            ..FakeHub::default()
+        })
+        .with("org/repo", ONNX, b"onnx-bytes")
+        .with(
+            "org/repo",
+            "config.json",
+            br#"{"max_position_embeddings":2048,"matryoshka_dimensions":[256]}"#,
+        )
+        .with(
+            "org/repo",
+            "tokenizer_config.json",
+            br#"{"model_max_length":8192}"#,
+        );
+        let artifact = fetch(&hub, &spec()).expect("fetch");
+        assert_eq!(artifact.max_length, 2048);
     }
 
     #[test]

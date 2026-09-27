@@ -42,24 +42,39 @@ patterns = { git = "https://github.com/jozefRudy/patterns", rev = "<sha>", defau
 
 Deps with versions that matter are pinned exactly in this crate
 (`fastembed =6.1.0`, `ort =2.0.0-rc.13` — which transitively pins a
-sha256-verified ONNX Runtime binary) and re-exported (`patterns::fastembed`,
-`patterns::ort`, `patterns::askama`); consumers never declare them separately.
+sha256-verified ONNX Runtime binary). `patterns::ort` and `patterns::askama`
+are re-exported so consumers never declare them separately; `fastembed` is
+internal to `embed` — models are described by `patterns::embed::ModelSpec`,
+whose enum mirrors (`Pooling`, `Quantization`, `TruncatedDims`) keep fastembed
+types out of the API.
 `patterns-macros` is an internal workspace member (path dependency) re-exported
 as `patterns::Extractable` / `patterns::SystemOne`.
 
 ## `embed` usage
 
 ```rust
-use patterns::embed::{Embedder, LoadOptions, Prefixes};
-use patterns::fastembed::EmbeddingModel;
+use patterns::embed::{Embedder, LoadOptions, ModelSpec, Pooling, Prefixes};
 
-// model + optional query/document prefixes (empty for symmetric models)
+// a model is a spec: repo + pinned commit + artifact file (+ native width).
+// Load verifies the bytes against the hub's own sha256 and refuses to fall back.
+let spec = ModelSpec::new(
+    "mixedbread-ai/mxbai-embed-large-v1",
+    "b33106f585b9ce46904ad7443a3b52b7a63e231c",
+    "onnx/model_quantized.onnx",
+    1024,
+)?
+.with_pooling(Pooling::Cls);          // 3-D graph output ⇒ declare how we reduce it
+
+// mxbai is symmetric: empty prefixes. (Asymmetric models pass their query/document prefixes.)
 let embedder = Embedder::load(
-    LoadOptions::new(EmbeddingModel::MxbaiEmbedLargeV1Q)
-        .with_prefixes(&Prefixes::new("search_query: ", "search_document: "))
+    LoadOptions::new(spec)
+        .with_prefixes(&Prefixes::new("", ""))
         .with_intra_threads(4),      // leave cores for other tasks
     &cache_dir,
 ).await?;
+
+// identity to write next to every vector (repo/file@revision#d<width>), e.g. row keys
+let model_id = embedder.model_id();
 
 // queries: one vector, never chunked
 let q = embedder.embed_query("rust jobs").await?;

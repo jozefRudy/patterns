@@ -78,8 +78,7 @@ let embedder = Embedder::load(
 ).await?;
 
 // `embedder.model_id()` is the identity to store beside each vector, e.g.
-//   mixedbread-ai/mxbai-embed-large-v1/onnx/model_quantized.onnx
-//     @b33106f585b9ce46904ad7443a3b52b7a63e231c#d1024+c74b8baca
+// mixedbread-ai/mxbai-embed-large-v1/onnx/model_quantized.onnx@b33106f585b9ce46904ad7443a3b52b7a63e231c#d1024+c74b8baca
 
 // queries: one vector, never chunked
 let q = embedder.embed_query("rust jobs").await?;

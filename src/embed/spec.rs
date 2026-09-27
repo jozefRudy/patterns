@@ -7,6 +7,8 @@ use std::num::NonZeroUsize;
 
 use anyhow::{Result, anyhow, ensure};
 
+use crate::prefixes::Prefixes;
+
 /// Minimum MRL width accepted (mirrors `embed_api`'s `MIN_DIMS`).
 const MIN_TRUNCATED_DIMS: usize = 32;
 
@@ -79,6 +81,8 @@ pub struct ModelSpec {
     native_dim: NonZeroUsize,
     /// MRL width to store instead of the native width; requesting one *is* the MRL claim.
     truncate_to: Option<TruncatedDims>,
+    /// Query/document prefixes the model was trained with (empty for symmetric models).
+    prefixes: Prefixes,
 }
 
 impl ModelSpec {
@@ -111,7 +115,16 @@ impl ModelSpec {
             quantization: Quantization::default(),
             native_dim,
             truncate_to: None,
+            prefixes: Prefixes::none(),
         })
+    }
+
+    /// Query/document prefixes the model was trained with — applied automatically by
+    /// [`crate::embed::Embedder::embed_query`] and the chunked document methods.
+    #[must_use]
+    pub fn with_prefixes(mut self, prefixes: &Prefixes) -> Self {
+        self.prefixes = prefixes.clone();
+        self
     }
 
     /// Force a graph output by name (read off the export, e.g. `"sentence_embedding"`).
@@ -175,6 +188,10 @@ impl ModelSpec {
 
     pub(super) const fn truncate_to(&self) -> Option<TruncatedDims> {
         self.truncate_to
+    }
+
+    pub(super) const fn prefixes(&self) -> &Prefixes {
+        &self.prefixes
     }
 }
 
@@ -299,12 +316,14 @@ mod tests {
         assert_eq!(base.pooling(), None);
         assert_eq!(base.quantization(), Quantization::None);
         assert!(base.truncate_to().is_none());
+        assert_eq!(base.prefixes(), &Prefixes::none());
 
         let built = spec()
             .with_output("sentence_embedding")
             .with_pooling(Pooling::Cls)
             .with_quantization(Quantization::Dynamic)
-            .with_truncated_dims(TruncatedDims::new(256).expect("256 ok"));
+            .with_truncated_dims(TruncatedDims::new(256).expect("256 ok"))
+            .with_prefixes(&Prefixes::new("search_query: ", "search_document: "));
         assert_eq!(built.output(), Some("sentence_embedding"));
         assert_eq!(built.pooling(), Some(Pooling::Cls));
         assert_eq!(built.quantization(), Quantization::Dynamic);
@@ -313,5 +332,7 @@ mod tests {
             Some(256),
             "truncated width is carried through"
         );
+        assert_eq!(built.prefixes().query, "search_query: ");
+        assert_eq!(built.prefixes().document, "search_document: ");
     }
 }

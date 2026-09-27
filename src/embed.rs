@@ -1,14 +1,14 @@
 //! Embedding generation via fastembed (ONNX, in-process).
 //!
 //! Machinery: model loading, blocking-offload, batching, fake embedder for
-//! tests, and query/document prefix handling. The **prefixes are model
-//! configuration** — passed at load time (e.g. `"search_query: "` /
-//! `"search_document: "` for nomic, `""`/`""` for BGE-M3) — after which
-//! `embed_query` and the chunked document methods apply them automatically.
+//! tests, and query/document prefix handling. The **prefixes are model configuration** and live
+//! on [`ModelSpec`] (e.g. `"search_query: "` / `"search_document: "` for nomic, `""`/`""` for
+//! BGE-M3); `embed_query` and the chunked document methods apply them automatically.
 //!
 //! A model is described by one [`ModelSpec`]: repo + pinned revision + file, fetched and verified
 //! at load, never taken from a fastembed table or a moving branch. Identity is
-//! `{repo}/{file}@{revision}#d{effective}[/meta|/spec]`; a failed fetch or verification is an
+//! `{repo}/{file}@{revision}#d{effective}+c{digest}[/meta|/spec]` (`digest` covers output,
+//! pooling, quantization and prefixes); a failed fetch or verification is an
 //! `Err` — never a silent model substitution, never a fallback model. Guard failure modes are
 //! documented on [`Embedder::load`].
 //!
@@ -59,20 +59,17 @@ pub struct LoadOptions {
     /// ONNX intra-op thread count (`None` = all cores). Set below core
     /// count to leave CPU for other tasks.
     pub intra_threads: Option<usize>,
-    /// Query/document prefixes (see [`Prefixes`]).
-    pub prefixes: Prefixes,
     /// Show model download progress bar on first fetch.
     pub show_download_progress: bool,
 }
 
 impl LoadOptions {
-    /// Defaults: all cores, no prefixes, download progress shown.
+    /// Defaults: all cores, download progress shown.
     #[must_use]
     pub const fn new(spec: ModelSpec) -> Self {
         Self {
             spec,
             intra_threads: None,
-            prefixes: Prefixes::none(),
             show_download_progress: true,
         }
     }
@@ -81,13 +78,6 @@ impl LoadOptions {
     #[must_use]
     pub const fn with_intra_threads(mut self, threads: usize) -> Self {
         self.intra_threads = Some(threads);
-        self
-    }
-
-    /// Set the model's query/document prefixes.
-    #[must_use]
-    pub fn with_prefixes(mut self, prefixes: &Prefixes) -> Self {
-        self.prefixes = prefixes.clone();
         self
     }
 
@@ -120,7 +110,7 @@ enum Inner {
         /// The model's own width, before MRL truncation (probed at load).
         native_dim: usize,
         truncated: Option<TruncatedDims>,
-        /// `{repo}/{file}@{revision}#d{effective}[/meta|/spec]`; part of every row's key.
+        /// `{repo}/{file}@{revision}#d{effective}+c{digest}[/meta|/spec]`; part of every row's key.
         model_id: String,
         prefixes: Prefixes,
         /// Truncation-disabled copy for counting: `token_count` reads it
@@ -150,9 +140,10 @@ impl Embedder {
         let LoadOptions {
             spec,
             intra_threads,
-            prefixes,
             show_download_progress,
         } = options;
+        // prefixes are model configuration, so they live on the spec
+        let prefixes = spec.prefixes().clone();
         let cache_dir = cache_dir.to_path_buf();
 
         let loaded = tokio::task::spawn_blocking(move || {
@@ -220,8 +211,10 @@ impl Embedder {
     }
 
     /// Identity of the loaded model, written into every embedding row:
-    /// `{repo}/{file}@{revision}#d{effective}`, with `/meta` when the truncated width came from
-    /// the artifact's `matryoshka_dimensions` and `/spec` when the request itself was the claim.
+    /// `{repo}/{file}@{revision}#d{effective}+c{digest}`, where the digest covers everything else
+    /// that shapes the vectors (output, pooling, quantization, prefixes), so two configurations of
+    /// one artifact cannot share an identity. `/meta` or `/spec` is appended when the width is
+    /// truncated — artifact-authorised versus claimed.
     #[must_use]
     pub fn model_id(&self) -> &str {
         match &self.0 {
@@ -564,7 +557,7 @@ fn tensor_rank(value_type: &ort::value::ValueType) -> usize {
 }
 
 /// Identity written into every embedding row:
-/// `{repo}/{file}@{revision}#d{effective}`, plus `/meta` or `/spec` when truncated.
+/// `{repo}/{file}@{revision}#d{effective}+c{digest}`, plus `/meta` or `/spec` when truncated.
 fn model_id(spec: &ModelSpec, mrl_from_metadata: bool) -> String {
     let effective = spec
         .truncate_to()
@@ -575,11 +568,40 @@ fn model_id(spec: &ModelSpec, mrl_from_metadata: bool) -> String {
         spec.file(),
         spec.revision()
     );
-    match (spec.truncate_to().is_some(), mrl_from_metadata) {
-        (false, _) => base,
-        (true, true) => format!("{base}/meta"),
-        (true, false) => format!("{base}/spec"),
-    }
+    let mrl = match (spec.truncate_to().is_some(), mrl_from_metadata) {
+        (false, _) => "",
+        (true, true) => "/meta",
+        (true, false) => "/spec",
+    };
+    format!("{base}+c{}{mrl}", config_digest(spec))
+}
+
+/// Digest of everything that shapes the vectors but is not already spelled out in the identity:
+/// the selected output, pooling, quantization and prefixes. Eight hex characters are plenty for a
+/// handful of configurations per artifact; widen [`CONFIG_DIGEST_HEX`] if that ever changes.
+fn config_digest(spec: &ModelSpec) -> String {
+    let pooling = match spec.pooling() {
+        None => "none",
+        Some(Pooling::Cls) => "cls",
+        Some(Pooling::Mean) => "mean",
+    };
+    let quantization = match spec.quantization() {
+        Quantization::None => "none",
+        Quantization::Static => "static",
+        Quantization::Dynamic => "dynamic",
+    };
+    let parts = [
+        spec.output().unwrap_or("none"),
+        pooling,
+        quantization,
+        &spec.prefixes().query,
+        &spec.prefixes().document,
+    ];
+    let digest = fnv1a_parts(&parts);
+    format!("{digest:016x}")
+        .chars()
+        .take(CONFIG_DIGEST_HEX)
+        .collect()
 }
 
 /// Plain description of a loaded graph, so the load-time guards are testable without ONNX.
@@ -722,6 +744,9 @@ fn check_pooling_meta(declared: Pooling, meta: &PoolingMeta, output: &str) -> Re
 /// Token window reported by the `Fake` embedder (no model, no tokenizer).
 const FAKE_MODEL_MAX_TOKENS: usize = 512;
 
+/// Hex characters of the configuration digest kept in the identity (32 bits at 8).
+const CONFIG_DIGEST_HEX: usize = 8;
+
 /// Identity reported by the `Fake` embedder (tests only).
 const FAKE_MODEL_ID: &str = "fake";
 
@@ -779,25 +804,26 @@ pub fn quantize_u8(values: &[f32]) -> Vec<u8> {
         .collect()
 }
 
-/// FNV-1a hash (fake-vector seeding).
-///
-/// # Panics
-/// Never in practice — `i` stays below `bytes.len()` by loop condition.
-#[expect(clippy::as_conversions, reason = "u8 to u64 widening cast is lossless")]
-#[expect(
-    clippy::indexing_slicing,
-    reason = "i < bytes.len() enforced by while condition"
-)]
-const fn fnv1a(text: &str) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        hash ^= bytes[i] as u64;
-        hash = hash.wrapping_mul(0x0100_0193);
-        i += 1;
+/// FNV-1a over `parts`, each separated by a `0xFF` byte so no field can bleed into the next
+/// (`["ab", "c"]` and `["a", "bc"]` hash differently). Used for fake-vector seeding and for the
+/// configuration digest in the model identity (`output`, pooling, quantization, prefixes).
+fn fnv1a_parts(parts: &[&str]) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0100_0193;
+    let mut hash = OFFSET;
+    for part in parts {
+        for byte in part.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+        hash ^= 0xFF;
+        hash = hash.wrapping_mul(PRIME);
     }
     hash
+}
+
+fn fnv1a(text: &str) -> u64 {
+    fnv1a_parts(&[text])
 }
 
 const fn splitmix64(seed: &mut u64) -> u64 {
@@ -1014,23 +1040,53 @@ mod tests {
 
     // ---- identity ---------------------------------------------------------------------
 
+    /// `{repo}/{file}@{rev}#d{effective}+c{digest}[/meta|/spec]`.
+    fn identity(spec: &ModelSpec, mrl_from_metadata: bool) -> String {
+        model_id(spec, mrl_from_metadata)
+    }
+
     #[test]
-    fn model_id_carries_revision_width_and_mrl_source() {
+    fn model_id_carries_revision_width_config_and_mrl_source() {
         let base = spec();
-        assert_eq!(
-            model_id(&base, false),
-            format!("org/repo/onnx/model.onnx@{SHA}#d768")
+        let id = identity(&base, false);
+        let (path, digest) = id.split_once("#d768+c").expect("shape");
+        assert_eq!(path, format!("org/repo/onnx/model.onnx@{SHA}"));
+        assert_eq!(digest.len(), CONFIG_DIGEST_HEX, "digest width: {digest}");
+        assert!(
+            digest.chars().all(|c| c.is_ascii_hexdigit()),
+            "digest is hex: {digest}"
         );
+        assert!(!id.ends_with("/meta") && !id.ends_with("/spec"));
 
         let truncated = base.with_truncated_dims(TruncatedDims::new(256).expect("256 ok"));
-        assert_eq!(
-            model_id(&truncated, true),
-            format!("org/repo/onnx/model.onnx@{SHA}#d256/meta")
-        );
-        assert_eq!(
-            model_id(&truncated, false),
-            format!("org/repo/onnx/model.onnx@{SHA}#d256/spec")
-        );
+        assert!(identity(&truncated, true).ends_with("/meta"));
+        assert!(identity(&truncated, false).ends_with("/spec"));
+        assert!(identity(&truncated, true).contains("#d256+c"));
+    }
+
+    #[test]
+    fn model_id_changes_with_every_vector_shaping_field() {
+        let base = spec();
+        let reference = identity(&base, false);
+
+        for changed in [
+            base.clone().with_output("sentence_embedding"),
+            base.clone().with_pooling(Pooling::Mean),
+            base.clone().with_quantization(Quantization::Static),
+            base.clone()
+                .with_prefixes(&Prefixes::new("search_query: ", "")),
+            base.clone()
+                .with_prefixes(&Prefixes::new("", "search_document: ")),
+        ] {
+            assert_ne!(
+                identity(&changed, false),
+                reference,
+                "the digest must cover output, pooling, quantization and both prefixes"
+            );
+        }
+
+        // identical configuration -> stable identity
+        assert_eq!(identity(&base, false), reference);
     }
 
     #[test]
@@ -1090,9 +1146,11 @@ mod tests {
             .expect("loads and passes every guard");
         assert_eq!(full.native_dim(), 768);
         assert_eq!(full.dim(), 768);
-        assert_eq!(
-            full.model_id(),
-            format!("{REPO}/onnx/model_quantized.onnx@{REV}#d768")
+        assert!(
+            full.model_id()
+                .starts_with(&format!("{REPO}/onnx/model_quantized.onnx@{REV}#d768+c")),
+            "identity: {}",
+            full.model_id()
         );
 
         let truncated = Embedder::load(
@@ -1103,7 +1161,7 @@ mod tests {
         .expect("256 is declared in matryoshka_dimensions");
         assert_eq!(truncated.dim(), 256);
         assert!(
-            truncated.model_id().ends_with("#d256/meta"),
+            truncated.model_id().contains("#d256+c") && truncated.model_id().ends_with("/meta"),
             "width authorised by the artifact's own matryoshka_dimensions"
         );
 

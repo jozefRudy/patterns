@@ -6,7 +6,7 @@
 //! `"search_document: "`, or Qwen's `"Instruct: <task>\nQuery:"` / `""`).
 
 /// Model's query/document prefixes (empty strings when the model uses none).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Prefixes {
     /// Prepended to queries, e.g. `"search_query: "`.
     pub query: String,

@@ -12,8 +12,9 @@ Modules (feature-gated; `default = ["llm_cli", "embed", "embed_api", "language",
   struct (`#[derive(Extractable)]` + `#[extract(template = "…", healthcheck = "…")]`);
   template files stay in consumers.
 - `embed` (feature `embed`) — text embeddings via fastembed (ONNX, CPU,
-  in-process). Model, thread count and query/document prefixes configured at
-  load; query/document methods apply prefixes automatically.
+  in-process) for any pinned, sha256-verified `ModelSpec`. Thread count at load;
+  a model's query/document prefixes travel with its spec, and the query/document
+  methods apply them automatically.
 - `language` (feature `language`) — English text detection via lingua.
   Process-wide singleton detector (`OnceLock<Arc<...>>` — memory optimization:
   preloaded language models load exactly once, shared by all instances; no
@@ -55,7 +56,8 @@ as `patterns::Extractable` / `patterns::SystemOne`.
 ```rust
 use patterns::embed::{Embedder, LoadOptions, ModelSpec, Pooling, Prefixes};
 
-// a model is a spec: repo + pinned commit + artifact file (+ native width).
+// a model is a spec: repo + pinned commit + artifact file + native width, plus how the
+// artifact becomes a vector (its output, pooling, MRL width) and its trained prefixes.
 // Load verifies the bytes against the hub's own sha256 and refuses to fall back.
 let spec = ModelSpec::new(
     "mixedbread-ai/mxbai-embed-large-v1",
@@ -63,18 +65,18 @@ let spec = ModelSpec::new(
     "onnx/model_quantized.onnx",
     1024,
 )?
-.with_pooling(Pooling::Cls);          // 3-D graph output ⇒ declare how we reduce it
+.with_pooling(Pooling::Cls)                  // 3-D graph output ⇒ declare how we reduce it
+.with_prefixes(&Prefixes::new("", ""));     // mxbai is symmetric; asymmetric models pass theirs
 
-// mxbai is symmetric: empty prefixes. (Asymmetric models pass their query/document prefixes.)
+// `LoadOptions` carries only runtime policy (threads, download progress)
 let embedder = Embedder::load(
-    LoadOptions::new(spec)
-        .with_prefixes(&Prefixes::new("", ""))
-        .with_intra_threads(4),      // leave cores for other tasks
+    LoadOptions::new(spec).with_intra_threads(4),   // leave cores for other tasks
     &cache_dir,
 ).await?;
 
-// identity to write next to every vector (repo/file@revision#d<width>), e.g. row keys
-let model_id = embedder.model_id();
+// `embedder.model_id()` is the identity to store beside each vector, e.g.
+//   mixedbread-ai/mxbai-embed-large-v1/onnx/model_quantized.onnx
+//     @b33106f585b9ce46904ad7443a3b52b7a63e231c#d1024+c74b8baca
 
 // queries: one vector, never chunked
 let q = embedder.embed_query("rust jobs").await?;
@@ -91,7 +93,7 @@ let skipped = (0..texts.len()).filter(|ix| !seen.contains(ix));  // below min_to
 ```
 
 Design:
-- **prefixes are model config**, applied by `embed_query` and the chunked
+- **prefixes are model config**, part of the `ModelSpec`, applied by `embed_query` and the chunked
   document methods — no prefix logic at call sites
 - **chunking is forced for documents**: tokenizer-exact, boundary-aware
   (paragraph → sentence → whitespace), with overlap and a no-tail-loss

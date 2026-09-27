@@ -53,6 +53,9 @@ as `patterns::Extractable` / `patterns::SystemOne`.
 
 ## `embed` usage
 
+Background — why the model is a spec you write rather than a name from fastembed's built-in table,
+and what that buys: [A Loader on Top of fastembed](https://jozefrudy.com/2026-09-27-fastembed-model-table/).
+
 ```rust
 use patterns::embed::{Embedder, LoadOptions, ModelSpec, Pooling, Prefixes};
 

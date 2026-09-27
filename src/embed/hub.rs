@@ -22,7 +22,6 @@ use crate::embed::{MetadataSource, PoolingMeta};
 const POOLING_FILE: &str = "1_Pooling/config.json";
 
 /// Everything `TextEmbedding::try_new_from_user_defined` and the load-time guards need.
-#[derive(Debug)]
 pub(super) struct Artifact {
     pub(super) onnx: Vec<u8>,
     /// `(file_name, bytes)` for external initializers — plain tuples, since fastembed's
@@ -376,7 +375,9 @@ mod tests {
             "tokenizer_config.json",
             b"{\"model_max_length\":512}",
         );
-        let error = fetch(&hub, &spec()).expect_err("tokenizer.json is missing");
+        let error = fetch(&hub, &spec())
+            .err()
+            .expect("tokenizer.json is missing");
         assert!(error.to_string().contains("tokenizer.json"), "{error}");
     }
 
@@ -412,7 +413,9 @@ mod tests {
             inner: hub,
             body: b"tampered".to_vec(),
         };
-        let error = fetch(&tampered, &spec()).expect_err("sha256 must mismatch");
+        let error = fetch(&tampered, &spec())
+            .err()
+            .expect("sha256 must mismatch");
         assert!(error.to_string().contains("sha256 mismatch"), "{error}");
     }
 
@@ -468,7 +471,9 @@ mod tests {
 
     #[test]
     fn fetch_rejects_an_empty_listing() {
-        let error = fetch(&FakeHub::default(), &spec()).expect_err("empty repo");
+        let error = fetch(&FakeHub::default(), &spec())
+            .err()
+            .expect("an empty listing must fail");
         assert!(error.to_string().contains("empty file listing"), "{error}");
     }
 }

@@ -15,8 +15,8 @@ use hf_hub::{Repo, RepoType};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use crate::embed::PoolingMeta;
 use crate::embed::spec::ModelSpec;
-use crate::embed::{MetadataSource, PoolingMeta};
 
 /// `1_Pooling/config.json` — present in sentence-transformers-format repos only.
 const POOLING_FILE: &str = "1_Pooling/config.json";
@@ -24,9 +24,6 @@ const POOLING_FILE: &str = "1_Pooling/config.json";
 /// Everything `TextEmbedding::try_new_from_user_defined` and the load-time guards need.
 pub(super) struct Artifact {
     pub(super) onnx: Vec<u8>,
-    /// `(file_name, bytes)` for external initializers — plain tuples, since fastembed's
-    /// `ExternalInitializerFile` is not nameable from outside the crate.
-    pub(super) external: Vec<(String, Vec<u8>)>,
     pub(super) tokenizer_files: TokenizerFiles,
     pub(super) pooling_meta: Option<PoolingMeta>,
     pub(super) matryoshka_dims: Option<Vec<usize>>,
@@ -140,11 +137,6 @@ pub(super) fn fetch<C: HubClient>(client: &C, spec: &ModelSpec) -> Result<Artifa
     };
 
     let onnx = read(spec.file())?;
-    let mut external = Vec::with_capacity(spec.additional().len());
-    for file in spec.additional() {
-        external.push((file.clone(), read(file)?));
-    }
-
     let tokenizer_files = TokenizerFiles {
         tokenizer_file: read("tokenizer.json")?,
         config_file: read("config.json")?,
@@ -154,7 +146,6 @@ pub(super) fn fetch<C: HubClient>(client: &C, spec: &ModelSpec) -> Result<Artifa
 
     Ok(Artifact {
         onnx,
-        external,
         max_length: parse_max_length(&tokenizer_files.tokenizer_config_file)?,
         matryoshka_dims: parse_matryoshka(&tokenizer_files.config_file)?,
         pooling_meta: read_pooling_meta(client, spec, &tree)?,
@@ -190,34 +181,20 @@ fn parse_matryoshka(config: &[u8]) -> Result<Option<Vec<usize>>> {
     Ok(Some(widths))
 }
 
-/// `1_Pooling/config.json` from the artifact repo, else from a declared metadata repo, else `None`.
+/// `1_Pooling/config.json` from the artifact repo, when it ships one (converted exports do not).
 fn read_pooling_meta<C: HubClient>(
     client: &C,
     spec: &ModelSpec,
     tree: &BTreeMap<String, Option<String>>,
 ) -> Result<Option<PoolingMeta>> {
-    if tree.contains_key(POOLING_FILE) {
-        let bytes = client.bytes(spec.repo(), spec.revision(), POOLING_FILE)?;
-        verify(
-            POOLING_FILE,
-            &bytes,
-            tree.get(POOLING_FILE).and_then(Option::as_deref),
-        )?;
-        return Ok(Some(parse_pooling_meta(&bytes)?));
-    }
-
-    let Some(MetadataSource { repo, revision }) = spec.pooling_metadata_from() else {
-        return Ok(None);
-    };
-    let other_tree = client.tree(repo, revision)?;
-    if !other_tree.contains_key(POOLING_FILE) {
+    if !tree.contains_key(POOLING_FILE) {
         return Ok(None);
     }
-    let bytes = client.bytes(repo, revision, POOLING_FILE)?;
+    let bytes = client.bytes(spec.repo(), spec.revision(), POOLING_FILE)?;
     verify(
         POOLING_FILE,
         &bytes,
-        other_tree.get(POOLING_FILE).and_then(Option::as_deref),
+        tree.get(POOLING_FILE).and_then(Option::as_deref),
     )?;
     Ok(Some(parse_pooling_meta(&bytes)?))
 }
@@ -358,7 +335,6 @@ mod tests {
         assert_eq!(artifact.max_length, 512);
         assert_eq!(artifact.matryoshka_dims, Some(vec![256]));
         assert!(artifact.pooling_meta.is_none(), "no 1_Pooling/config.json");
-        assert_eq!(artifact.external, []);
     }
 
     #[test]
@@ -447,26 +423,6 @@ mod tests {
         assert!(meta.cls);
         assert!(!meta.mean);
         assert_eq!(meta.include_prompt, Some(false));
-    }
-
-    #[test]
-    fn fetch_falls_back_to_the_declared_metadata_repo_for_pooling() {
-        let hub = tokenizer_files(FakeHub {
-            hashed: true,
-            ..FakeHub::default()
-        })
-        .with("org/repo", ONNX, b"onnx-bytes")
-        .with(
-            "upstream/repo",
-            "1_Pooling/config.json",
-            b"{\"pooling_mode_mean_tokens\":true}",
-        );
-        let spec = spec().with_pooling_metadata_from("upstream/repo", SHA);
-        let meta = fetch(&hub, &spec)
-            .expect("fetch")
-            .pooling_meta
-            .expect("pooling metadata came from the metadata repo");
-        assert!(meta.mean, "metadata repo's flags are used");
     }
 
     #[test]

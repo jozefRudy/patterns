@@ -32,8 +32,9 @@ pub mod spec;
 
 pub use spec::{ModelSpec, Pooling, Quantization, TruncatedDims};
 
-/// Pooling flags parsed from a repo's `1_Pooling/config.json`. `None` for the whole struct means
-/// the file was absent in both the artifact and any declared metadata repo.
+/// Pooling flags parsed from the artifact repo's `1_Pooling/config.json`; `None` means the repo
+/// does not ship one (converted ONNX exports usually do not), in which case a declared pooling
+/// stands unverified.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[expect(
     clippy::struct_excessive_bools,
@@ -48,13 +49,6 @@ struct PoolingMeta {
     lasttoken: bool,
     /// Missing in some repos (e.g. bge) — treat `None` as `true`.
     include_prompt: Option<bool>,
-}
-
-/// Secondary repo consulted only for `1_Pooling/config.json` (converted ONNX exports drop it).
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MetadataSource {
-    repo: String,
-    revision: String,
 }
 
 /// Load-time configuration for [`Embedder`].
@@ -467,7 +461,7 @@ fn load_blocking(
     let client = hub::HubFiles::new(cache_dir.to_path_buf(), show_download_progress)?;
     let artifact = hub::fetch(&client, spec)?;
 
-    let desc = graph_desc(&artifact.onnx, &artifact.external)?;
+    let desc = graph_desc(&artifact.onnx)?;
     let selected = validate_graph(
         &desc,
         spec,
@@ -477,9 +471,6 @@ fn load_blocking(
 
     let mut model = UserDefinedEmbeddingModel::new(artifact.onnx, artifact.tokenizer_files)
         .with_quantization(spec.quantization().into());
-    for (file_name, buffer) in artifact.external {
-        model = model.with_external_initializer(file_name, buffer);
-    }
     if let Some(pooling) = selected.pooling {
         model = model.with_pooling(pooling.into());
     }
@@ -541,16 +532,11 @@ fn load_blocking(
 ///
 /// A throwaway session is the only way to see this: fastembed owns the real one and does not
 /// expose it. Graph optimisation is disabled here, so this is cheap relative to the real load.
-fn graph_desc(onnx: &[u8], external: &[(String, Vec<u8>)]) -> Result<GraphDesc> {
+fn graph_desc(onnx: &[u8]) -> Result<GraphDesc> {
     let mut builder = ort::session::Session::builder()
         .map_err(|err| anyhow!("create an ONNX Runtime session builder: {err}"))?
         .with_optimization_level(GraphOptimizationLevel::Disable)
         .map_err(|err| anyhow!("disable graph optimisation for the inspection session: {err}"))?;
-    for (file_name, buffer) in external {
-        builder = builder
-            .with_external_initializer_file_in_memory(file_name.clone(), buffer.clone().into())
-            .map_err(|err| anyhow!("attach an external initializer for inspection: {err}"))?;
-    }
     let session = builder
         .commit_from_memory(onnx)
         .map_err(|err| anyhow!("load the graph for inspection: {err}"))?;

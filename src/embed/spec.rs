@@ -7,8 +7,6 @@ use std::num::NonZeroUsize;
 
 use anyhow::{Result, anyhow, ensure};
 
-use super::MetadataSource;
-
 /// Minimum MRL width accepted (mirrors `embed_api`'s `MIN_DIMS`).
 const MIN_TRUNCATED_DIMS: usize = 32;
 
@@ -71,15 +69,12 @@ pub struct ModelSpec {
     /// Artifact path within the repo, e.g. `onnx/model_quantized.onnx`.
     file: String,
     /// External-initializer files (`*.onnx_data`) that `file` references, if any.
-    additional: Vec<String>,
     /// Graph output to read. `None` requires the graph to have exactly one output.
     output: Option<&'static str>,
     /// How to reduce a 3-D output; `None` means the selected output is already pooled.
     pooling: Option<Pooling>,
     /// Decides fastembed's batching rule; `Dynamic` forbids splitting one call into batches.
     quantization: Quantization,
-    /// Repo to read `1_Pooling/config.json` from when the artifact's own repo has none.
-    pooling_metadata_from: Option<MetadataSource>,
     /// The model's own width, before any MRL truncation.
     native_dim: NonZeroUsize,
     /// MRL width to store instead of the native width; requesting one *is* the MRL claim.
@@ -111,21 +106,12 @@ impl ModelSpec {
             repo,
             revision,
             file,
-            additional: Vec::new(),
             output: None,
             pooling: None,
             quantization: Quantization::default(),
-            pooling_metadata_from: None,
             native_dim,
             truncate_to: None,
         })
-    }
-
-    /// External-initializer files (`*.onnx_data`) fetched alongside `file`.
-    #[must_use]
-    pub fn with_additional(mut self, files: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        self.additional = files.into_iter().map(Into::into).collect();
-        self
     }
 
     /// Force a graph output by name (read off the export, e.g. `"sentence_embedding"`).
@@ -151,21 +137,6 @@ impl ModelSpec {
         self
     }
 
-    /// Verify pooling against this repo's `1_Pooling/config.json` when the artifact's own repo
-    /// has none (typical for converted ONNX exports).
-    #[must_use]
-    pub fn with_pooling_metadata_from(
-        mut self,
-        repo: impl Into<String>,
-        revision: impl Into<String>,
-    ) -> Self {
-        self.pooling_metadata_from = Some(MetadataSource {
-            repo: repo.into(),
-            revision: revision.into(),
-        });
-        self
-    }
-
     /// Requesting a width *is* the MRL claim; the artifact's `matryoshka_dimensions` (when
     /// declared) constrains it at load.
     #[must_use]
@@ -186,10 +157,6 @@ impl ModelSpec {
         &self.file
     }
 
-    pub(super) const fn additional(&self) -> &[String] {
-        self.additional.as_slice()
-    }
-
     pub(super) const fn output(&self) -> Option<&'static str> {
         self.output
     }
@@ -200,10 +167,6 @@ impl ModelSpec {
 
     pub(super) const fn quantization(&self) -> Quantization {
         self.quantization
-    }
-
-    pub(super) const fn pooling_metadata_from(&self) -> Option<&MetadataSource> {
-        self.pooling_metadata_from.as_ref()
     }
 
     pub(super) const fn native_dim(&self) -> usize {
@@ -332,28 +295,19 @@ mod tests {
         assert_eq!(base.revision(), SHA);
         assert_eq!(base.file(), "onnx/model.onnx");
         assert_eq!(base.native_dim(), 768);
-        assert_eq!(base.additional(), <&[String]>::default());
         assert_eq!(base.output(), None);
         assert_eq!(base.pooling(), None);
         assert_eq!(base.quantization(), Quantization::None);
-        assert!(base.pooling_metadata_from().is_none());
         assert!(base.truncate_to().is_none());
 
         let built = spec()
-            .with_additional(["onnx/model.onnx_data"])
             .with_output("sentence_embedding")
             .with_pooling(Pooling::Cls)
             .with_quantization(Quantization::Dynamic)
-            .with_pooling_metadata_from("upstream/repo", SHA)
             .with_truncated_dims(TruncatedDims::new(256).expect("256 ok"));
-        assert_eq!(built.additional(), ["onnx/model.onnx_data"]);
         assert_eq!(built.output(), Some("sentence_embedding"));
         assert_eq!(built.pooling(), Some(Pooling::Cls));
         assert_eq!(built.quantization(), Quantization::Dynamic);
-        assert_eq!(
-            built.pooling_metadata_from().map(|m| m.repo.as_str()),
-            Some("upstream/repo")
-        );
         assert_eq!(
             built.truncate_to().map(TruncatedDims::get),
             Some(256),

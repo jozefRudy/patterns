@@ -12,7 +12,7 @@ Modules (feature-gated; `default = ["llm_cli", "embed", "embed_api", "language",
   struct (`#[derive(Extractable)]` + `#[extract(template = "…", healthcheck = "…")]`);
   template files stay in consumers.
 - `embed` (feature `embed`) — text embeddings via fastembed (ONNX, CPU,
-  in-process) for any pinned, sha256-verified `ModelSpec`. Thread count at load;
+  in-process) for any pinned, content-verified `ModelSpec`. Thread count at load;
   a model's query/document prefixes travel with its spec, and the query/document
   methods apply them automatically.
 - `language` (feature `language`) — English text detection via lingua.
@@ -61,7 +61,7 @@ use patterns::embed::{Embedder, LoadOptions, ModelSpec, Pooling, Prefixes};
 
 // a model is a spec: repo + pinned commit + artifact file + native width, plus how the
 // artifact becomes a vector (its output, pooling, MRL width) and its trained prefixes.
-// Load verifies the bytes against the hub's own sha256 and refuses to fall back.
+// Load verifies the bytes against the hub's own content hashes and refuses to fall back.
 let spec = ModelSpec::new(
     "mixedbread-ai/mxbai-embed-large-v1",
     "b33106f585b9ce46904ad7443a3b52b7a63e231c",

@@ -1,5 +1,6 @@
 //! All network I/O for the load path: fetch an artifact at a pinned revision, verify its bytes
-//! against the hub's own sha256, read the metadata the load-time guards need.
+//! against the hub's own content hashes (sha256 for LFS files, git blob sha1 for the rest), read
+//! the metadata the load-time guards need.
 //!
 //! The file listing (path → sha256) for a pinned revision is immutable, so it is cached on disk;
 //! a warm load needs no network at all (the artifact bytes come from hf-hub's own blob cache).
@@ -15,7 +16,8 @@ use anyhow::{Context, Result, anyhow, ensure};
 use fastembed::TokenizerFiles;
 use hf_hub::api::sync::{Api, ApiBuilder};
 use hf_hub::{Repo, RepoType};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha1::Sha1;
 use sha2::{Digest, Sha256};
 
 use crate::embed::PoolingMeta;
@@ -34,10 +36,22 @@ pub(super) struct Artifact {
     pub(super) max_length: usize,
 }
 
+/// Expected content hash for one file in a repo tree.
+///
+/// LFS files carry a sha256; git-tracked files (configs, tokenizer, vocab) have no LFS entry but
+/// do have a git blob id — so every file is verifiable, not just the large ones.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) enum TreeHash {
+    /// `lfs.sha256`: sha256 of the file's content.
+    Sha256(String),
+    /// `blobId`: sha1 of the git blob (`sha1("blob {len}\0" + content)`).
+    GitBlobSha1(String),
+}
+
 /// Hub seam, injectable so tests run without network.
 pub(super) trait HubClient {
-    /// `path -> sha256` for LFS files (`None` for small git-tracked files), at that revision.
-    fn tree(&self, repo: &str, revision: &str) -> Result<BTreeMap<String, Option<String>>>;
+    /// `path -> content hash` for the repo at that revision.
+    fn tree(&self, repo: &str, revision: &str) -> Result<BTreeMap<String, TreeHash>>;
 
     /// File contents; `Err` when the file is absent at that revision.
     fn bytes(&self, repo: &str, revision: &str, file: &str) -> Result<Vec<u8>>;
@@ -80,7 +94,7 @@ impl HubFiles {
 }
 
 impl HubClient for HubFiles {
-    fn tree(&self, repo: &str, revision: &str) -> Result<BTreeMap<String, Option<String>>> {
+    fn tree(&self, repo: &str, revision: &str) -> Result<BTreeMap<String, TreeHash>> {
         let path = self.tree_cache_path(repo, revision);
         if let Some(cached) = read_tree_cache(&path) {
             return Ok(cached);
@@ -98,7 +112,14 @@ impl HubClient for HubFiles {
         let tree = listing
             .siblings
             .into_iter()
-            .map(|entry| (entry.rfilename, entry.lfs.map(|lfs| lfs.sha256)))
+            .map(|entry| {
+                // LFS entries expose `lfs.sha256`; every entry has `blobId`.
+                let hash = match entry.lfs {
+                    Some(lfs) => TreeHash::Sha256(lfs.sha256),
+                    None => TreeHash::GitBlobSha1(entry.blob_id),
+                };
+                (entry.rfilename, hash)
+            })
             .collect();
         write_tree_cache(&path, &tree);
         Ok(tree)
@@ -114,7 +135,7 @@ impl HubClient for HubFiles {
 }
 
 /// Read a cached listing; `None` when absent or unparseable (falls back to the network).
-fn read_tree_cache(path: &Path) -> Option<BTreeMap<String, Option<String>>> {
+fn read_tree_cache(path: &Path) -> Option<BTreeMap<String, TreeHash>> {
     let bytes = std::fs::read(path).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
@@ -123,7 +144,7 @@ fn read_tree_cache(path: &Path) -> Option<BTreeMap<String, Option<String>>> {
 ///
 /// Best-effort: a cache is an optimization, so any failure here (unwritable dir, full disk) is
 /// swallowed — the listing is already in hand and the load must not fail because of it.
-fn write_tree_cache(path: &Path, tree: &BTreeMap<String, Option<String>>) {
+fn write_tree_cache(path: &Path, tree: &BTreeMap<String, TreeHash>) {
     let Some(parent) = path.parent() else {
         return;
     };
@@ -150,6 +171,9 @@ struct RepoListing {
 #[derive(Deserialize)]
 struct RepoEntry {
     rfilename: String,
+    /// Git blob oid; present for every file.
+    #[serde(rename = "blobId")]
+    blob_id: String,
     lfs: Option<LfsEntry>,
 }
 
@@ -161,7 +185,7 @@ struct LfsEntry {
 /// Fetch and verify everything the load path needs for `spec`.
 ///
 /// # Errors
-/// A missing required file, a sha256 mismatch against the hub's own listing, or unparseable
+/// A missing required file, a content-hash mismatch against the hub's own listing, or unparseable
 /// `config.json` / `tokenizer_config.json` / `1_Pooling/config.json`. Never falls back to another
 /// model: rows are keyed by the identity of what was actually loaded.
 pub(super) fn fetch<C: HubClient>(client: &C, spec: &ModelSpec) -> Result<Artifact> {
@@ -174,14 +198,15 @@ pub(super) fn fetch<C: HubClient>(client: &C, spec: &ModelSpec) -> Result<Artifa
     );
 
     let read = |file: &str| -> Result<Vec<u8>> {
-        ensure!(
-            tree.contains_key(file),
-            "{}@{}: `{file}` is not in the repo",
-            spec.repo(),
-            spec.revision()
-        );
+        let expected = tree.get(file).ok_or_else(|| {
+            anyhow!(
+                "{}@{}: `{file}` is not in the repo",
+                spec.repo(),
+                spec.revision()
+            )
+        })?;
         let bytes = client.bytes(spec.repo(), spec.revision(), file)?;
-        verify(file, &bytes, tree.get(file).and_then(Option::as_deref))?;
+        verify(file, &bytes, expected)?;
         Ok(bytes)
     };
 
@@ -234,17 +259,13 @@ fn parse_matryoshka(config: &[u8]) -> Result<Option<Vec<usize>>> {
 fn read_pooling_meta<C: HubClient>(
     client: &C,
     spec: &ModelSpec,
-    tree: &BTreeMap<String, Option<String>>,
+    tree: &BTreeMap<String, TreeHash>,
 ) -> Result<Option<PoolingMeta>> {
-    if !tree.contains_key(POOLING_FILE) {
+    let Some(expected) = tree.get(POOLING_FILE) else {
         return Ok(None);
-    }
+    };
     let bytes = client.bytes(spec.repo(), spec.revision(), POOLING_FILE)?;
-    verify(
-        POOLING_FILE,
-        &bytes,
-        tree.get(POOLING_FILE).and_then(Option::as_deref),
-    )?;
+    verify(POOLING_FILE, &bytes, expected)?;
     Ok(Some(parse_pooling_meta(&bytes)?))
 }
 
@@ -283,18 +304,27 @@ fn parse_pooling_meta(bytes: &[u8]) -> Result<PoolingMeta> {
     })
 }
 
-/// Always-on artifact verification: bytes must hash to the sha256 the hub reports for that path.
-/// Files the hub does not track as LFS have no hash to compare — revision pinning covers them.
-fn verify(file: &str, bytes: &[u8], expected: Option<&str>) -> Result<()> {
-    let Some(expected) = expected else {
-        return Ok(());
+/// Always-on artifact verification: bytes must hash to the hash the hub reports for that path.
+/// LFS files are checked against their sha256; git-tracked files against their git blob sha1 —
+/// so every file the loader reads is covered.
+fn verify(file: &str, bytes: &[u8], expected: &TreeHash) -> Result<()> {
+    let (kind, actual, expected) = match expected {
+        TreeHash::Sha256(expected) => ("sha256", hex(&Sha256::digest(bytes)), expected),
+        TreeHash::GitBlobSha1(expected) => ("git blob sha1", git_blob_sha1(bytes), expected),
     };
-    let actual = hex(&Sha256::digest(bytes));
     ensure!(
-        actual == expected,
-        "sha256 mismatch for `{file}`: got {actual}, hub reports {expected}"
+        actual == *expected,
+        "{kind} mismatch for `{file}`: got {actual}, hub reports {expected}"
     );
     Ok(())
+}
+
+/// Git object id of a blob: `sha1("blob {len}\0" + content)`, matching the hub's `blobId`.
+fn git_blob_sha1(bytes: &[u8]) -> String {
+    let mut hasher = Sha1::new();
+    hasher.update(format!("blob {}\0", bytes.len()).as_bytes());
+    hasher.update(bytes);
+    hex(&hasher.finalize())
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -331,15 +361,20 @@ mod tests {
     }
 
     impl HubClient for FakeHub {
-        fn tree(&self, repo: &str, revision: &str) -> Result<BTreeMap<String, Option<String>>> {
+        fn tree(&self, repo: &str, revision: &str) -> Result<BTreeMap<String, TreeHash>> {
             let _ = revision;
             Ok(self
                 .files
                 .iter()
                 .filter(|((owner, _), _)| owner == repo)
                 .map(|((_, file), body)| {
-                    let entry = self.hashed.then(|| hex(&Sha256::digest(body)));
-                    (file.clone(), entry)
+                    // `hashed` selects the LFS (sha256) vs git-blob (sha1) branch, as the hub does.
+                    let hash = if self.hashed {
+                        TreeHash::Sha256(hex(&Sha256::digest(body)))
+                    } else {
+                        TreeHash::GitBlobSha1(git_blob_sha1(body))
+                    };
+                    (file.clone(), hash)
                 })
                 .collect())
         }
@@ -376,9 +411,15 @@ mod tests {
     fn tree_cache_round_trips_and_ignores_corruption() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("nested/org--repo@sha.json");
-        let tree: BTreeMap<String, Option<String>> = BTreeMap::from([
-            ("onnx/model.onnx".to_string(), Some("abc123".to_string())),
-            ("config.json".to_string(), None),
+        let tree: BTreeMap<String, TreeHash> = BTreeMap::from([
+            (
+                "onnx/model.onnx".to_string(),
+                TreeHash::Sha256("abc123".to_string()),
+            ),
+            (
+                "config.json".to_string(),
+                TreeHash::GitBlobSha1("def456".to_string()),
+            ),
         ]);
 
         assert_eq!(read_tree_cache(&path), None, "absent cache misses");
@@ -398,8 +439,8 @@ mod tests {
     fn hub_files_serves_tree_from_disk_cache_without_network() {
         let dir = tempfile::tempdir().expect("tempdir");
         let hub = HubFiles::new(dir.path().to_path_buf(), false).expect("build hub client");
-        let tree: BTreeMap<String, Option<String>> =
-            BTreeMap::from([(ONNX.to_string(), Some("deadbeef".to_string()))]);
+        let tree: BTreeMap<String, TreeHash> =
+            BTreeMap::from([(ONNX.to_string(), TreeHash::Sha256("deadbeef".to_string()))]);
 
         // a repo that does not exist: a network call would fail, so a cache hit proves offline
         let repo = "example/nonexistent";
@@ -448,9 +489,12 @@ mod tests {
     }
 
     impl HubClient for Tampered {
-        fn tree(&self, repo: &str, revision: &str) -> Result<BTreeMap<String, Option<String>>> {
+        fn tree(&self, repo: &str, revision: &str) -> Result<BTreeMap<String, TreeHash>> {
             let mut tree = self.inner.tree(repo, revision)?;
-            tree.insert(ONNX.to_string(), Some(hex(&Sha256::digest(b"expected"))));
+            tree.insert(
+                ONNX.to_string(),
+                TreeHash::Sha256(hex(&Sha256::digest(b"expected"))),
+            );
             Ok(tree)
         }
 
@@ -480,14 +524,49 @@ mod tests {
     }
 
     #[test]
-    fn fetch_skips_verification_for_unhashed_files() {
+    fn fetch_verifies_git_tracked_files_via_blob_sha1() {
+        // `hashed: false` → the listing carries git blob ids (sha1), as for non-LFS files.
         let hub = tokenizer_files(FakeHub {
             hashed: false,
             ..FakeHub::default()
         })
         .with("org/repo", ONNX, b"onnx-bytes");
-        let artifact = fetch(&hub, &spec()).expect("non-LFS files have no hash to check");
+        let artifact = fetch(&hub, &spec()).expect("git-tracked files verify via blob sha1");
         assert_eq!(artifact.onnx, b"onnx-bytes");
+    }
+
+    /// Serves git-tracked files whose content does not match the listed `blobId`.
+    struct TamperedBlob {
+        inner: FakeHub,
+    }
+
+    impl HubClient for TamperedBlob {
+        fn tree(&self, repo: &str, revision: &str) -> Result<BTreeMap<String, TreeHash>> {
+            self.inner.tree(repo, revision)
+        }
+
+        fn bytes(&self, repo: &str, revision: &str, file: &str) -> Result<Vec<u8>> {
+            if file == "tokenizer.json" {
+                return Ok(b"tampered".to_vec());
+            }
+            self.inner.bytes(repo, revision, file)
+        }
+    }
+
+    #[test]
+    fn fetch_rejects_a_git_blob_sha1_mismatch() {
+        let hub = tokenizer_files(FakeHub {
+            hashed: false,
+            ..FakeHub::default()
+        })
+        .with("org/repo", ONNX, b"onnx-bytes");
+        let error = fetch(&TamperedBlob { inner: hub }, &spec())
+            .err()
+            .expect("git blob sha1 must mismatch");
+        assert!(
+            error.to_string().contains("git blob sha1 mismatch"),
+            "{error}"
+        );
     }
 
     #[test]

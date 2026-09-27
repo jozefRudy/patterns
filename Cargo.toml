@@ -22,6 +22,7 @@ lingua = { version = "1.8.0", default-features = false, features = ["english", "
 tokenizers = { version = "0.23", default-features = false, optional = true }
 hf-hub = { version = "0.5", default-features = false, optional = true }
 sha2 = { version = "0.11", optional = true }
+sha1 = { version = "0.11", optional = true }
 ort = { version = "=2.0.0-rc.13", optional = true, default-features = false }
 
 [features]
@@ -37,6 +38,7 @@ embed = [
     "hf-hub/ureq",
     "hf-hub/native-tls",
     "dep:sha2",
+    "dep:sha1",
 ]
 embed_api = ["dep:reqwest", "dep:tokenizers", "tokenizers/fancy-regex", "dep:hf-hub", "hf-hub/ureq", "hf-hub/native-tls"]
 language = ["dep:lingua"]

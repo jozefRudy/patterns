@@ -1,12 +1,15 @@
 //! All network I/O for the load path: fetch an artifact at a pinned revision, verify its bytes
 //! against the hub's own sha256, read the metadata the load-time guards need.
 //!
+//! The file listing (path → sha256) for a pinned revision is immutable, so it is cached on disk;
+//! a warm load needs no network at all (the artifact bytes come from hf-hub's own blob cache).
+//!
 //! Runs inside `spawn_blocking` (hf-hub's API is sync). The `HubClient` seam exists so this
 //! module's tests run fully offline.
 
 use std::collections::BTreeMap;
 use std::fmt::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use fastembed::TokenizerFiles;
@@ -43,16 +46,22 @@ pub(super) trait HubClient {
 /// Real client: hf-hub with a persistent cache dir.
 pub(super) struct HubFiles {
     api: Api,
+    /// Where per-revision file listings are cached; see [`write_tree_cache`].
+    tree_cache_dir: PathBuf,
 }
 
 impl HubFiles {
     pub(super) fn new(cache_dir: PathBuf, show_download_progress: bool) -> Result<Self> {
+        let tree_cache_dir = cache_dir.join("hub-trees");
         let api = ApiBuilder::new()
             .with_cache_dir(cache_dir)
             .with_progress(show_download_progress)
             .build()
             .context("initialise the HuggingFace hub client")?;
-        Ok(Self { api })
+        Ok(Self {
+            api,
+            tree_cache_dir,
+        })
     }
 
     fn repo(&self, repo: &str, revision: &str) -> hf_hub::api::sync::ApiRepo {
@@ -62,10 +71,20 @@ impl HubFiles {
             revision.to_string(),
         ))
     }
+
+    /// `{tree_cache_dir}/{repo--}@{revision}.json` (revision is a pinned sha, so the name is stable).
+    fn tree_cache_path(&self, repo: &str, revision: &str) -> PathBuf {
+        self.tree_cache_dir
+            .join(format!("{}@{revision}.json", repo.replace('/', "--")))
+    }
 }
 
 impl HubClient for HubFiles {
     fn tree(&self, repo: &str, revision: &str) -> Result<BTreeMap<String, Option<String>>> {
+        let path = self.tree_cache_path(repo, revision);
+        if let Some(cached) = read_tree_cache(&path) {
+            return Ok(cached);
+        }
         let mut response = self
             .repo(repo, revision)
             .info_request()
@@ -76,11 +95,13 @@ impl HubClient for HubFiles {
             .body_mut()
             .read_json()
             .with_context(|| format!("parse the file listing of {repo}@{revision}"))?;
-        Ok(listing
+        let tree = listing
             .siblings
             .into_iter()
             .map(|entry| (entry.rfilename, entry.lfs.map(|lfs| lfs.sha256)))
-            .collect())
+            .collect();
+        write_tree_cache(&path, &tree);
+        Ok(tree)
     }
 
     fn bytes(&self, repo: &str, revision: &str, file: &str) -> Result<Vec<u8>> {
@@ -90,6 +111,34 @@ impl HubClient for HubFiles {
             .with_context(|| format!("fetch {repo}/{file}@{revision}"))?;
         std::fs::read(&path).with_context(|| format!("read the cached file {}", path.display()))
     }
+}
+
+/// Read a cached listing; `None` when absent or unparseable (falls back to the network).
+fn read_tree_cache(path: &Path) -> Option<BTreeMap<String, Option<String>>> {
+    let bytes = std::fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Persist a listing for a pinned revision.
+///
+/// Best-effort: a cache is an optimization, so any failure here (unwritable dir, full disk) is
+/// swallowed — the listing is already in hand and the load must not fail because of it.
+fn write_tree_cache(path: &Path, tree: &BTreeMap<String, Option<String>>) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let Ok(bytes) = serde_json::to_vec(tree) else {
+        return;
+    };
+    // temp + rename so a concurrent reader never sees a half-written file
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, bytes).is_err() {
+        return;
+    }
+    std::fs::rename(&tmp, path).unwrap_or_default();
 }
 
 /// `/api/models/{repo}/revision/{rev}?blobs=true` — only the fields we need.
@@ -321,6 +370,41 @@ mod tests {
 
     fn spec() -> ModelSpec {
         ModelSpec::new("org/repo", SHA, ONNX, 768).expect("valid spec")
+    }
+
+    #[test]
+    fn tree_cache_round_trips_and_ignores_corruption() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nested/org--repo@sha.json");
+        let tree: BTreeMap<String, Option<String>> = BTreeMap::from([
+            ("onnx/model.onnx".to_string(), Some("abc123".to_string())),
+            ("config.json".to_string(), None),
+        ]);
+
+        assert_eq!(read_tree_cache(&path), None, "absent cache misses");
+
+        write_tree_cache(&path, &tree);
+        assert_eq!(
+            read_tree_cache(&path),
+            Some(tree),
+            "written tree round-trips"
+        );
+
+        std::fs::write(&path, b"not json").expect("overwrite");
+        assert_eq!(read_tree_cache(&path), None, "corrupt cache is ignored");
+    }
+
+    #[test]
+    fn hub_files_serves_tree_from_disk_cache_without_network() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hub = HubFiles::new(dir.path().to_path_buf(), false).expect("build hub client");
+        let tree: BTreeMap<String, Option<String>> =
+            BTreeMap::from([(ONNX.to_string(), Some("deadbeef".to_string()))]);
+
+        // a repo that does not exist: a network call would fail, so a cache hit proves offline
+        let repo = "example/nonexistent";
+        write_tree_cache(&hub.tree_cache_path(repo, SHA), &tree);
+        assert_eq!(hub.tree(repo, SHA).expect("served from cache"), tree);
     }
 
     #[test]

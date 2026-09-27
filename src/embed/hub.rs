@@ -15,27 +15,28 @@ use hf_hub::{Repo, RepoType};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::embed::spec::{MetadataSource, ModelSpec, PoolingMeta};
+use crate::embed::spec::ModelSpec;
+use crate::embed::{MetadataSource, PoolingMeta};
 
 /// `1_Pooling/config.json` — present in sentence-transformers-format repos only.
 const POOLING_FILE: &str = "1_Pooling/config.json";
 
 /// Everything `TextEmbedding::try_new_from_user_defined` and the load-time guards need.
 #[derive(Debug)]
-pub struct Artifact {
-    pub(crate) onnx: Vec<u8>,
+pub(super) struct Artifact {
+    pub(super) onnx: Vec<u8>,
     /// `(file_name, bytes)` for external initializers — plain tuples, since fastembed's
     /// `ExternalInitializerFile` is not nameable from outside the crate.
-    pub(crate) external: Vec<(String, Vec<u8>)>,
-    pub(crate) tokenizer_files: TokenizerFiles,
-    pub(crate) pooling_meta: Option<PoolingMeta>,
-    pub(crate) matryoshka_dims: Option<Vec<usize>>,
+    pub(super) external: Vec<(String, Vec<u8>)>,
+    pub(super) tokenizer_files: TokenizerFiles,
+    pub(super) pooling_meta: Option<PoolingMeta>,
+    pub(super) matryoshka_dims: Option<Vec<usize>>,
     /// Tokenizer window, from `tokenizer_config.json`'s `model_max_length`.
-    pub(crate) max_length: usize,
+    pub(super) max_length: usize,
 }
 
 /// Hub seam, injectable so tests run without network.
-pub trait HubClient {
+pub(super) trait HubClient {
     /// `path -> sha256` for LFS files (`None` for small git-tracked files), at that revision.
     fn tree(&self, repo: &str, revision: &str) -> Result<BTreeMap<String, Option<String>>>;
 
@@ -44,12 +45,12 @@ pub trait HubClient {
 }
 
 /// Real client: hf-hub with a persistent cache dir.
-pub struct HubFiles {
+pub(super) struct HubFiles {
     api: Api,
 }
 
 impl HubFiles {
-    pub fn new(cache_dir: PathBuf, show_download_progress: bool) -> Result<Self> {
+    pub(super) fn new(cache_dir: PathBuf, show_download_progress: bool) -> Result<Self> {
         let api = ApiBuilder::new()
             .with_cache_dir(cache_dir)
             .with_progress(show_download_progress)
@@ -118,7 +119,7 @@ struct LfsEntry {
 /// A missing required file, a sha256 mismatch against the hub's own listing, or unparseable
 /// `config.json` / `tokenizer_config.json` / `1_Pooling/config.json`. Never falls back to another
 /// model: rows are keyed by the identity of what was actually loaded.
-pub fn fetch<C: HubClient>(client: &C, spec: &ModelSpec) -> Result<Artifact> {
+pub(super) fn fetch<C: HubClient>(client: &C, spec: &ModelSpec) -> Result<Artifact> {
     let tree = client.tree(spec.repo(), spec.revision())?;
     ensure!(
         !tree.is_empty(),

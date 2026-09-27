@@ -7,8 +7,10 @@ use std::num::NonZeroUsize;
 
 use anyhow::{Result, anyhow, ensure};
 
+use super::MetadataSource;
+
 /// Minimum MRL width accepted (mirrors `embed_api`'s `MIN_DIMS`).
-pub(crate) const MIN_TRUNCATED_DIMS: usize = 32;
+const MIN_TRUNCATED_DIMS: usize = 32;
 
 /// How a 3-D (token-level) graph output is reduced to one vector per text.
 ///
@@ -51,34 +53,9 @@ impl TruncatedDims {
         Ok(Self(value))
     }
 
-    pub(crate) const fn get(self) -> usize {
+    pub(super) const fn get(self) -> usize {
         self.0.get()
     }
-}
-
-/// Pooling flags parsed from a repo's `1_Pooling/config.json`. `None` for the whole struct means
-/// the file was absent in both the artifact and any declared metadata repo.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "mirrors the 1_Pooling/config.json flag set verbatim"
-)]
-pub(crate) struct PoolingMeta {
-    pub(crate) cls: bool,
-    pub(crate) mean: bool,
-    pub(crate) max: bool,
-    pub(crate) weightedmean: bool,
-    pub(crate) mean_sqrt_len: bool,
-    pub(crate) lasttoken: bool,
-    /// Missing in some repos (e.g. bge) — treat `None` as `true`.
-    pub(crate) include_prompt: Option<bool>,
-}
-
-/// Secondary repo consulted only for `1_Pooling/config.json` (converted ONNX exports drop it).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MetadataSource {
-    pub(crate) repo: String,
-    pub(crate) revision: String,
 }
 
 /// The only model interface: everything needed to fetch, verify and load one embedding artifact.
@@ -88,25 +65,25 @@ pub(crate) struct MetadataSource {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelSpec {
     /// Hub repository, e.g. `mixedbread-ai/mxbai-embed-large-v1`.
-    pub(crate) repo: String,
+    repo: String,
     /// Full commit sha — never a branch or tag, so the fetched bytes cannot change.
-    pub(crate) revision: String,
+    revision: String,
     /// Artifact path within the repo, e.g. `onnx/model_quantized.onnx`.
-    pub(crate) file: String,
+    file: String,
     /// External-initializer files (`*.onnx_data`) that `file` references, if any.
-    pub(crate) additional: Vec<String>,
+    additional: Vec<String>,
     /// Graph output to read. `None` requires the graph to have exactly one output.
-    pub(crate) output: Option<&'static str>,
+    output: Option<&'static str>,
     /// How to reduce a 3-D output; `None` means the selected output is already pooled.
-    pub(crate) pooling: Option<Pooling>,
+    pooling: Option<Pooling>,
     /// Decides fastembed's batching rule; `Dynamic` forbids splitting one call into batches.
-    pub(crate) quantization: Quantization,
+    quantization: Quantization,
     /// Repo to read `1_Pooling/config.json` from when the artifact's own repo has none.
-    pub(crate) pooling_metadata_from: Option<MetadataSource>,
+    pooling_metadata_from: Option<MetadataSource>,
     /// The model's own width, before any MRL truncation.
-    pub(crate) native_dim: NonZeroUsize,
+    native_dim: NonZeroUsize,
     /// MRL width to store instead of the native width; requesting one *is* the MRL claim.
-    pub(crate) truncate_to: Option<TruncatedDims>,
+    truncate_to: Option<TruncatedDims>,
 }
 
 impl ModelSpec {
@@ -197,43 +174,43 @@ impl ModelSpec {
         self
     }
 
-    pub(crate) fn repo(&self) -> &str {
+    pub(super) fn repo(&self) -> &str {
         &self.repo
     }
 
-    pub(crate) fn revision(&self) -> &str {
+    pub(super) fn revision(&self) -> &str {
         &self.revision
     }
 
-    pub(crate) fn file(&self) -> &str {
+    pub(super) fn file(&self) -> &str {
         &self.file
     }
 
-    pub(crate) const fn additional(&self) -> &[String] {
+    pub(super) const fn additional(&self) -> &[String] {
         self.additional.as_slice()
     }
 
-    pub(crate) const fn output(&self) -> Option<&'static str> {
+    pub(super) const fn output(&self) -> Option<&'static str> {
         self.output
     }
 
-    pub(crate) const fn pooling(&self) -> Option<Pooling> {
+    pub(super) const fn pooling(&self) -> Option<Pooling> {
         self.pooling
     }
 
-    pub(crate) const fn quantization(&self) -> Quantization {
+    pub(super) const fn quantization(&self) -> Quantization {
         self.quantization
     }
 
-    pub(crate) const fn pooling_metadata_from(&self) -> Option<&MetadataSource> {
+    pub(super) const fn pooling_metadata_from(&self) -> Option<&MetadataSource> {
         self.pooling_metadata_from.as_ref()
     }
 
-    pub(crate) const fn native_dim(&self) -> usize {
+    pub(super) const fn native_dim(&self) -> usize {
         self.native_dim.get()
     }
 
-    pub(crate) const fn truncate_to(&self) -> Option<TruncatedDims> {
+    pub(super) const fn truncate_to(&self) -> Option<TruncatedDims> {
         self.truncate_to
     }
 }

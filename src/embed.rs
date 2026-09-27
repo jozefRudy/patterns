@@ -27,10 +27,35 @@ pub use crate::chunk::{ChunkOptions, EmbeddedChunk, TextChunk};
 use crate::chunk::{SPECIAL_TOKEN_HEADROOM, TokenSpan, chunk_spans, fake_token_spans};
 pub use crate::prefixes::Prefixes;
 
-pub(crate) mod hub;
+mod hub;
 pub mod spec;
 
 pub use spec::{ModelSpec, Pooling, Quantization, TruncatedDims};
+
+/// Pooling flags parsed from a repo's `1_Pooling/config.json`. `None` for the whole struct means
+/// the file was absent in both the artifact and any declared metadata repo.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "mirrors the 1_Pooling/config.json flag set verbatim"
+)]
+struct PoolingMeta {
+    cls: bool,
+    mean: bool,
+    max: bool,
+    weightedmean: bool,
+    mean_sqrt_len: bool,
+    lasttoken: bool,
+    /// Missing in some repos (e.g. bge) — treat `None` as `true`.
+    include_prompt: Option<bool>,
+}
+
+/// Secondary repo consulted only for `1_Pooling/config.json` (converted ONNX exports drop it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MetadataSource {
+    repo: String,
+    revision: String,
+}
 
 /// Load-time configuration for [`Embedder`].
 #[derive(Clone, Debug)]
@@ -573,22 +598,22 @@ fn model_id(spec: &ModelSpec, mrl_from_metadata: bool) -> String {
 
 /// Plain description of a loaded graph, so the load-time guards are testable without ONNX.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct GraphDesc {
-    pub(crate) inputs: Vec<String>,
+struct GraphDesc {
+    inputs: Vec<String>,
     /// Output name → tensor rank (2 = already pooled, 3 = token-level).
-    pub(crate) outputs: Vec<(String, usize)>,
+    outputs: Vec<(String, usize)>,
 }
 
 /// What the guards decided: which output to read, how to reduce it, and how the truncated width
 /// was authorised.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SelectedOutput {
-    pub(crate) name: String,
+struct SelectedOutput {
+    name: String,
     /// `Some` when the selected output is 3-D and we must pool it.
-    pub(crate) pooling: Option<Pooling>,
+    pooling: Option<Pooling>,
     /// `true` when the truncated width was authorised by the artifact's `matryoshka_dimensions`
     /// (identity suffix `/meta`), `false` when the request itself was the claim (`/spec`).
-    pub(crate) mrl_from_metadata: bool,
+    mrl_from_metadata: bool,
 }
 
 /// Inputs fastembed feeds; a graph needing anything else cannot run in-process.
@@ -600,10 +625,10 @@ const FEEDABLE_INPUTS: [&str; 3] = ["input_ids", "attention_mask", "token_type_i
 /// Inputs outside [`FEEDABLE_INPUTS`]; `spec.output` unset on a multi-output graph; a named output
 /// that does not exist; a 3-D output without an explicitly declared pooling, or one that
 /// contradicts `pooling_meta`; a truncated width absent from the declared MRL widths.
-pub(crate) fn validate_graph(
+fn validate_graph(
     desc: &GraphDesc,
     spec: &ModelSpec,
-    pooling_meta: Option<&spec::PoolingMeta>,
+    pooling_meta: Option<&PoolingMeta>,
     matryoshka_dims: Option<&[usize]>,
 ) -> Result<SelectedOutput> {
     let unsupported: Vec<&str> = desc
@@ -682,7 +707,7 @@ fn output_names(desc: &GraphDesc) -> String {
 }
 
 /// Cross-check a declared pooling against the artifact's own `1_Pooling/config.json`.
-fn check_pooling_meta(declared: Pooling, meta: &spec::PoolingMeta, output: &str) -> Result<()> {
+fn check_pooling_meta(declared: Pooling, meta: &PoolingMeta, output: &str) -> Result<()> {
     ensure!(
         !meta.lasttoken,
         "1_Pooling declares last-token pooling, unsupported in-process (output `{output}`)"
@@ -842,11 +867,11 @@ mod tests {
         }
     }
 
-    fn meta_cls() -> spec::PoolingMeta {
-        spec::PoolingMeta {
+    fn meta_cls() -> PoolingMeta {
+        PoolingMeta {
             cls: true,
             include_prompt: Some(true),
-            ..spec::PoolingMeta::default()
+            ..PoolingMeta::default()
         }
     }
 
@@ -919,9 +944,9 @@ mod tests {
         // The graph already pooled; `lasttoken` describes how the export did it, so it is not an
         // obstacle when we are not the ones pooling.
         let desc = desc(&["input_ids"], &[("sentence_embedding", 2)]);
-        let meta = spec::PoolingMeta {
+        let meta = PoolingMeta {
             lasttoken: true,
-            ..spec::PoolingMeta::default()
+            ..PoolingMeta::default()
         };
         validate_graph(&desc, &spec(), Some(&meta), None)
             .expect("pre-pooled output is unaffected by pooling metadata");
@@ -954,20 +979,20 @@ mod tests {
         let pooling = spec().with_pooling(Pooling::Cls);
 
         for meta in [
-            spec::PoolingMeta {
+            PoolingMeta {
                 cls: true,
                 lasttoken: true,
-                ..spec::PoolingMeta::default()
+                ..PoolingMeta::default()
             },
-            spec::PoolingMeta {
+            PoolingMeta {
                 cls: true,
                 max: true,
-                ..spec::PoolingMeta::default()
+                ..PoolingMeta::default()
             },
-            spec::PoolingMeta {
+            PoolingMeta {
                 cls: true,
                 include_prompt: Some(false),
-                ..spec::PoolingMeta::default()
+                ..PoolingMeta::default()
             },
         ] {
             assert!(

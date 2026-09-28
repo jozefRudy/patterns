@@ -70,7 +70,6 @@ pub struct ModelSpec {
     revision: String,
     /// Artifact path within the repo, e.g. `onnx/model_quantized.onnx`.
     file: String,
-    /// External-initializer files (`*.onnx_data`) that `file` references, if any.
     /// Graph output to read. `None` requires the graph to have exactly one output.
     output: Option<&'static str>,
     /// How to reduce a 3-D output; `None` means the selected output is already pooled.

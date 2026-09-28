@@ -77,8 +77,15 @@ let embedder = Embedder::load(
     &cache_dir,
 ).await?;
 
-// `embedder.model_id()` is the identity to store beside each vector, e.g.
-// mixedbread-ai/mxbai-embed-large-v1/onnx/model_quantized.onnx@b33106f585b9ce46904ad7443a3b52b7a63e231c#d1024+c74b8baca
+// inspect what produced a vector; store `id()` (compact, fixed-length) or its parts beside each
+// vector — two runs are reuse-safe exactly when their `id()` match
+let identity = embedder.identity();
+identity.id();            // the key to store per vector: 32 hex, filesystem/SQL-safe
+                          // Keyed only on what can change the vector — exact model, spec
+                          // (output/pooling/quantization/prefixes), width, tokenizer version.
+                          // Labels (revision/repo/file) and execution crates (fastembed/ort/ndarray)
+                          // are excluded, so their bumps do not force a re-embed.
+// display (human form, NOT the key): {repo}/{file}@{revision}#d{dim}+c{spec_digest}+e{engine_digest}[/meta|/spec]
 
 // queries: one vector, never chunked
 let q = embedder.embed_query("rust jobs").await?;
@@ -121,6 +128,12 @@ Design:
   (query + bulk). That's capacity policy, so it stays a consumer decision
 - `Embedder::fake(dim)` returns deterministic hash vectors for tests of
   embedding-adjacent logic (stores, ranking) without a model download
+- **identity** (`embedder.identity()`): a `ModelIdentity` whose compact `id()` is keyed only on what
+  can reshape the token stream — the exact model, the spec choices
+  (output/pooling/quantization/prefixes), the stored width + MRL source, and the tokenizer version.
+  The git revision, repo/file name, and execution crates (`fastembed`, `ort`, `ndarray`) are **not**
+  in `id()`. Identical bytes over the same pins reuse the same `id`; anything that can reshape the
+  token stream yields a new `id` — the signal to re-embed. Store `id()` beside each vector.
 
 
 ## `embed_api` usage

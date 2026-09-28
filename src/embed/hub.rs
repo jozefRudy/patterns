@@ -34,6 +34,8 @@ pub(super) struct Artifact {
     pub(super) matryoshka_dims: Option<Vec<usize>>,
     /// Trained token window: tokenizer `model_max_length` clamped by the model's `max_position_embeddings`.
     pub(super) max_length: usize,
+    /// sha256 over every verified file (`path\0hash\n`), independent of the hub's hash scheme.
+    pub(super) content_hash: String,
 }
 
 /// Expected content hash for one file in a repo tree.
@@ -197,26 +199,24 @@ pub(super) fn fetch<C: HubClient>(client: &C, spec: &ModelSpec) -> Result<Artifa
         spec.revision()
     );
 
-    let read = |file: &str| -> Result<Vec<u8>> {
-        let expected = tree.get(file).ok_or_else(|| {
-            anyhow!(
-                "{}@{}: `{file}` is not in the repo",
-                spec.repo(),
-                spec.revision()
-            )
-        })?;
-        let bytes = client.bytes(spec.repo(), spec.revision(), file)?;
-        verify(file, &bytes, expected)?;
-        Ok(bytes)
+    let mut reads = Reads {
+        client,
+        spec,
+        tree: &tree,
+        hashes: BTreeMap::new(),
     };
-
-    let onnx = read(spec.file())?;
+    let onnx = reads.read(spec.file())?;
     let tokenizer_files = TokenizerFiles {
-        tokenizer_file: read("tokenizer.json")?,
-        config_file: read("config.json")?,
-        special_tokens_map_file: read("special_tokens_map.json")?,
-        tokenizer_config_file: read("tokenizer_config.json")?,
+        tokenizer_file: reads.read("tokenizer.json")?,
+        config_file: reads.read("config.json")?,
+        special_tokens_map_file: reads.read("special_tokens_map.json")?,
+        tokenizer_config_file: reads.read("tokenizer_config.json")?,
     };
+    let pooling_meta = reads
+        .read_optional(POOLING_FILE)?
+        .map(|bytes| parse_pooling_meta(&bytes))
+        .transpose()?;
+    let content_hash = reads.content_hash();
 
     Ok(Artifact {
         onnx,
@@ -225,9 +225,60 @@ pub(super) fn fetch<C: HubClient>(client: &C, spec: &ModelSpec) -> Result<Artifa
             &tokenizer_files.config_file,
         )?,
         matryoshka_dims: parse_matryoshka(&tokenizer_files.config_file)?,
-        pooling_meta: read_pooling_meta(client, spec, &tree)?,
+        pooling_meta,
         tokenizer_files,
+        content_hash,
     })
+}
+
+/// Reads (and verifies) required files, recording each file's content sha256 for the fingerprint.
+struct Reads<'a, C: HubClient> {
+    client: &'a C,
+    spec: &'a ModelSpec,
+    tree: &'a BTreeMap<String, TreeHash>,
+    /// `path -> sha256(content)`, in path order.
+    hashes: BTreeMap<String, String>,
+}
+
+impl<C: HubClient> Reads<'_, C> {
+    /// Verified contents of a required file, or `Err` when it is absent.
+    fn read(&mut self, file: &str) -> Result<Vec<u8>> {
+        let expected = self.tree.get(file).ok_or_else(|| {
+            anyhow!(
+                "{}@{}: `{file}` is not in the repo",
+                self.spec.repo(),
+                self.spec.revision()
+            )
+        })?;
+        let bytes = self
+            .client
+            .bytes(self.spec.repo(), self.spec.revision(), file)?;
+        verify(file, &bytes, expected)?;
+        self.hashes
+            .insert(file.to_string(), hex(&Sha256::digest(&bytes)));
+        Ok(bytes)
+    }
+
+    /// Verified contents of an optional file, or `Ok(None)` when the repo does not ship it.
+    fn read_optional(&mut self, file: &str) -> Result<Option<Vec<u8>>> {
+        if self.tree.contains_key(file) {
+            self.read(file).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Composite content hash over every file read so far.
+    fn content_hash(&self) -> String {
+        let mut hasher = Sha256::new();
+        for (path, hash) in &self.hashes {
+            hasher.update(path.as_bytes());
+            hasher.update([0]);
+            hasher.update(hash.as_bytes());
+            hasher.update(*b"\n");
+        }
+        hex(&hasher.finalize())
+    }
 }
 
 /// Trained token window: tokenizer `model_max_length` clamped to the model's `max_position_embeddings`.
@@ -270,20 +321,6 @@ fn parse_matryoshka(config: &[u8]) -> Result<Option<Vec<usize>>> {
         .filter_map(|dim| usize::try_from(dim).ok())
         .collect();
     Ok(Some(widths))
-}
-
-/// `1_Pooling/config.json` from the artifact repo, when it ships one (converted exports do not).
-fn read_pooling_meta<C: HubClient>(
-    client: &C,
-    spec: &ModelSpec,
-    tree: &BTreeMap<String, TreeHash>,
-) -> Result<Option<PoolingMeta>> {
-    let Some(expected) = tree.get(POOLING_FILE) else {
-        return Ok(None);
-    };
-    let bytes = client.bytes(spec.repo(), spec.revision(), POOLING_FILE)?;
-    verify(POOLING_FILE, &bytes, expected)?;
-    Ok(Some(parse_pooling_meta(&bytes)?))
 }
 
 #[derive(Deserialize)]
@@ -476,7 +513,45 @@ mod tests {
         assert_eq!(artifact.onnx, b"onnx-bytes");
         assert_eq!(artifact.max_length, 512);
         assert_eq!(artifact.matryoshka_dims, Some(vec![256]));
+        assert!(!artifact.content_hash.is_empty(), "fingerprint is set");
         assert!(artifact.pooling_meta.is_none(), "no 1_Pooling/config.json");
+    }
+
+    #[test]
+    fn content_hash_tracks_file_bytes_not_the_revision() {
+        let build = |body: &[u8]| {
+            let hub = tokenizer_files(FakeHub {
+                hashed: true,
+                ..FakeHub::default()
+            })
+            .with("org/repo", ONNX, body);
+            fetch(&hub, &spec()).expect("fetch").content_hash
+        };
+        let reference = build(b"onnx-bytes");
+        assert_eq!(build(b"onnx-bytes"), reference, "same bytes -> same hash");
+        assert_ne!(
+            build(b"other-bytes"),
+            reference,
+            "changed bytes -> changed hash"
+        );
+
+        // a different revision that resolves to the same bytes must not change the fingerprint
+        let other_revision = ModelSpec::new(
+            "org/repo",
+            "1111111111111111111111111111111111111111",
+            ONNX,
+            768,
+        )
+        .expect("valid spec");
+        let hub = tokenizer_files(FakeHub {
+            hashed: true,
+            ..FakeHub::default()
+        })
+        .with("org/repo", ONNX, b"onnx-bytes");
+        assert_eq!(
+            fetch(&hub, &other_revision).expect("fetch").content_hash,
+            reference
+        );
     }
 
     #[test]

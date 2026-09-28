@@ -6,9 +6,10 @@
 //! BGE-M3); `embed_query` and the chunked document methods apply them automatically.
 //!
 //! A model is described by one [`ModelSpec`]: repo + pinned revision + file, fetched and verified
-//! at load, never taken from a fastembed table or a moving branch. Identity is
-//! `{repo}/{file}@{revision}#d{effective}+c{digest}[/meta|/spec]` (`digest` covers output,
-//! pooling, quantization and prefixes); a failed fetch or verification is an
+//! at load, never taken from a fastembed table or a moving branch. Its identity is a
+//! [`ModelIdentity`]: a compact `id()` keyed on the verified bytes, the spec choices, the stored
+//! width and the tokenizer version — deliberately not on the revision, repo name or execution
+//! crates, so their bumps do not force a re-embed. A failed fetch or verification is an
 //! `Err` — never a silent model substitution, never a fallback model. Guard failure modes are
 //! documented on [`Embedder::load`].
 //!
@@ -28,8 +29,10 @@ use crate::chunk::{SPECIAL_TOKEN_HEADROOM, TokenSpan, chunk_spans, fake_token_sp
 pub use crate::prefixes::Prefixes;
 
 mod hub;
+mod identity;
 pub mod spec;
 
+pub use identity::{ModelIdentity, MrlSource};
 pub use spec::{ModelSpec, Pooling, Quantization, TruncatedDims};
 
 /// Pooling flags parsed from the artifact repo's `1_Pooling/config.json`; `None` means the repo
@@ -102,6 +105,8 @@ enum Inner {
         native_dim: usize,
         truncated: Option<TruncatedDims>,
         prefixes: Prefixes,
+        /// Synthetic identity (`repo`/`file` are `fake`).
+        identity: ModelIdentity,
     },
     FastEmbed {
         model: Arc<Mutex<TextEmbedding>>,
@@ -110,8 +115,8 @@ enum Inner {
         /// The model's own width, before MRL truncation (probed at load).
         native_dim: usize,
         truncated: Option<TruncatedDims>,
-        /// `{repo}/{file}@{revision}#d{effective}+c{digest}[/meta|/spec]`; part of every row's key.
-        model_id: String,
+        /// Complete model identity; exposed via [`Embedder::identity`].
+        identity: ModelIdentity,
         prefixes: Prefixes,
         /// Truncation-disabled copy for counting: `token_count` reads it
         /// immutably (`Tokenizer::encode` takes `&self`) — no lock, so counting
@@ -159,7 +164,7 @@ impl Embedder {
                 .map_or(loaded.native_dim, TruncatedDims::get),
             native_dim: loaded.native_dim,
             truncated: loaded.truncated,
-            model_id: loaded.model_id,
+            identity: loaded.identity,
             prefixes,
             count_tokenizer: Arc::new(loaded.count_tokenizer),
         }))
@@ -179,18 +184,21 @@ impl Embedder {
             native_dim: dim,
             truncated: None,
             prefixes: prefixes.clone(),
+            identity: ModelIdentity::fake(dim, prefixes),
         })
     }
 
     /// Fake embedder whose vectors are truncated to `truncated`, for offline width tests.
     #[cfg(test)]
     #[must_use]
-    pub const fn fake_truncated(native_dim: usize, truncated: TruncatedDims) -> Self {
+    pub fn fake_truncated(native_dim: usize, truncated: TruncatedDims) -> Self {
+        let dim = truncated.get();
         Self(Inner::Fake {
-            dim: truncated.get(),
+            dim,
             native_dim,
             truncated: Some(truncated),
             prefixes: Prefixes::none(),
+            identity: ModelIdentity::fake(dim, &Prefixes::none()),
         })
     }
 
@@ -210,16 +218,13 @@ impl Embedder {
         }
     }
 
-    /// Identity of the loaded model, written into every embedding row:
-    /// `{repo}/{file}@{revision}#d{effective}+c{digest}`, where the digest covers everything else
-    /// that shapes the vectors (output, pooling, quantization, prefixes), so two configurations of
-    /// one artifact cannot share an identity. `/meta` or `/spec` is appended when the width is
-    /// truncated — artifact-authorised versus claimed.
+    /// Identity of the loaded model: the compact `id()` is keyed on the verified bytes, the spec
+    /// choices, the width and the tokenizer version (never the revision or execution crates), so
+    /// equal ids mean comparable vectors. See [`ModelIdentity`].
     #[must_use]
-    pub fn model_id(&self) -> &str {
+    pub const fn identity(&self) -> &ModelIdentity {
         match &self.0 {
-            Inner::Fake { .. } => FAKE_MODEL_ID,
-            Inner::FastEmbed { model_id, .. } => model_id,
+            Inner::Fake { identity, .. } | Inner::FastEmbed { identity, .. } => identity,
         }
     }
 
@@ -439,7 +444,7 @@ struct Loaded {
     embedder: TextEmbedding,
     native_dim: usize,
     truncated: Option<TruncatedDims>,
-    model_id: String,
+    identity: ModelIdentity,
     count_tokenizer: tokenizers::Tokenizer,
 }
 
@@ -462,6 +467,7 @@ fn load_blocking(
         artifact.matryoshka_dims.as_deref(),
     )?;
 
+    let identity = ModelIdentity::new(spec, artifact.content_hash, selected.mrl_from_metadata);
     let mut model = UserDefinedEmbeddingModel::new(artifact.onnx, artifact.tokenizer_files)
         .with_quantization(spec.quantization().into());
     if let Some(pooling) = selected.pooling {
@@ -511,12 +517,11 @@ fn load_blocking(
         .with_truncation(None)
         .map_err(|e| anyhow!("disable truncation: {e}"))?;
 
-    let model_id = model_id(spec, selected.mrl_from_metadata);
     Ok(Loaded {
         embedder,
         native_dim,
         truncated: spec.truncate_to(),
-        model_id,
+        identity,
         count_tokenizer,
     })
 }
@@ -554,54 +559,6 @@ fn tensor_rank(value_type: &ort::value::ValueType) -> usize {
         ort::value::ValueType::Tensor { shape, .. } => shape.len(),
         _ => 0,
     }
-}
-
-/// Identity written into every embedding row:
-/// `{repo}/{file}@{revision}#d{effective}+c{digest}`, plus `/meta` or `/spec` when truncated.
-fn model_id(spec: &ModelSpec, mrl_from_metadata: bool) -> String {
-    let effective = spec
-        .truncate_to()
-        .map_or_else(|| spec.native_dim(), TruncatedDims::get);
-    let base = format!(
-        "{}/{}@{}#d{effective}",
-        spec.repo(),
-        spec.file(),
-        spec.revision()
-    );
-    let mrl = match (spec.truncate_to().is_some(), mrl_from_metadata) {
-        (false, _) => "",
-        (true, true) => "/meta",
-        (true, false) => "/spec",
-    };
-    format!("{base}+c{}{mrl}", config_digest(spec))
-}
-
-/// Digest of everything that shapes the vectors but is not already spelled out in the identity:
-/// the selected output, pooling, quantization and prefixes. Eight hex characters are plenty for a
-/// handful of configurations per artifact; widen [`CONFIG_DIGEST_HEX`] if that ever changes.
-fn config_digest(spec: &ModelSpec) -> String {
-    let pooling = match spec.pooling() {
-        None => "none",
-        Some(Pooling::Cls) => "cls",
-        Some(Pooling::Mean) => "mean",
-    };
-    let quantization = match spec.quantization() {
-        Quantization::None => "none",
-        Quantization::Static => "static",
-        Quantization::Dynamic => "dynamic",
-    };
-    let parts = [
-        spec.output().unwrap_or("none"),
-        pooling,
-        quantization,
-        &spec.prefixes().query,
-        &spec.prefixes().document,
-    ];
-    let digest = fnv1a_parts(&parts);
-    format!("{digest:016x}")
-        .chars()
-        .take(CONFIG_DIGEST_HEX)
-        .collect()
 }
 
 /// Plain description of a loaded graph, so the load-time guards are testable without ONNX.
@@ -744,12 +701,6 @@ fn check_pooling_meta(declared: Pooling, meta: &PoolingMeta, output: &str) -> Re
 /// Token window reported by the `Fake` embedder (no model, no tokenizer).
 const FAKE_MODEL_MAX_TOKENS: usize = 512;
 
-/// Hex characters of the configuration digest kept in the identity (32 bits at 8).
-const CONFIG_DIGEST_HEX: usize = 8;
-
-/// Identity reported by the `Fake` embedder (tests only).
-const FAKE_MODEL_ID: &str = "fake";
-
 /// Number of bytes needed to pack `dims` sign bits (8 bits per byte).
 #[must_use]
 pub const fn packed_len(dims: usize) -> usize {
@@ -805,8 +756,7 @@ pub fn quantize_u8(values: &[f32]) -> Vec<u8> {
 }
 
 /// FNV-1a over `parts`, each separated by a `0xFF` byte so no field can bleed into the next
-/// (`["ab", "c"]` and `["a", "bc"]` hash differently). Used for fake-vector seeding and for the
-/// configuration digest in the model identity (`output`, pooling, quantization, prefixes).
+/// (`["ab", "c"]` and `["a", "bc"]` hash differently). Used for deterministic fake-vector seeding.
 fn fnv1a_parts(parts: &[&str]) -> u64 {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0100_0193;
@@ -1040,32 +990,73 @@ mod tests {
 
     // ---- identity ---------------------------------------------------------------------
 
-    /// `{repo}/{file}@{rev}#d{effective}+c{digest}[/meta|/spec]`.
-    fn identity(spec: &ModelSpec, mrl_from_metadata: bool) -> String {
-        model_id(spec, mrl_from_metadata)
+    const CONTENT: &str = "content-hash";
+
+    fn identity(spec: &ModelSpec, mrl_from_metadata: bool) -> ModelIdentity {
+        ModelIdentity::new(spec, CONTENT.to_string(), mrl_from_metadata)
     }
 
     #[test]
-    fn model_id_carries_revision_width_config_and_mrl_source() {
-        let base = spec();
-        let id = identity(&base, false);
-        let (path, digest) = id.split_once("#d768+c").expect("shape");
-        assert_eq!(path, format!("org/repo/onnx/model.onnx@{SHA}"));
-        assert_eq!(digest.len(), CONFIG_DIGEST_HEX, "digest width: {digest}");
+    fn identity_carries_parts_and_a_compact_id() {
+        let id = identity(&spec(), false);
+        assert_eq!(id.repo(), "org/repo");
+        assert_eq!(id.file(), "onnx/model.onnx");
+        assert_eq!(id.revision(), SHA);
+        assert_eq!(id.content_hash(), CONTENT);
+        assert_eq!(id.dim(), 768);
+        assert_eq!(id.spec_digest().len(), 8, "spec digest width");
+        assert!(id.spec_digest().chars().all(|c| c.is_ascii_hexdigit()));
         assert!(
-            digest.chars().all(|c| c.is_ascii_hexdigit()),
-            "digest is hex: {digest}"
+            !id.tokenizer_digest().is_empty(),
+            "tokenizer fingerprint is baked"
         );
-        assert!(!id.ends_with("/meta") && !id.ends_with("/spec"));
-
-        let truncated = base.with_truncated_dims(TruncatedDims::new(256).expect("256 ok"));
-        assert!(identity(&truncated, true).ends_with("/meta"));
-        assert!(identity(&truncated, false).ends_with("/spec"));
-        assert!(identity(&truncated, true).contains("#d256+c"));
+        assert!(
+            !id.engine_digest().is_empty(),
+            "engine fingerprint is baked"
+        );
+        assert!(
+            !id.engine_digest().contains("tokenizers"),
+            "tokenizers is an identity input, not an execution crate"
+        );
+        assert_eq!(id.mrl_source(), None);
+        assert_eq!(id.id().len(), 32, "compact id width");
+        assert!(id.id().chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
-    fn model_id_changes_with_every_vector_shaping_field() {
+    fn identity_id_ignores_revision_and_tracks_content() {
+        let base = spec();
+        let reference = identity(&base, false);
+
+        // a revision bump over identical bytes is a relabel: same id, no re-embed
+        let other_revision = ModelSpec::new(
+            "org/repo",
+            "1111111111111111111111111111111111111111",
+            "onnx/model.onnx",
+            768,
+        )
+        .expect("valid spec");
+        assert_eq!(identity(&other_revision, false).id(), reference.id());
+
+        // repo/file are labels, not determinants: same content hash -> same id
+        let renamed = ModelSpec::new(
+            "other/repo",
+            "1111111111111111111111111111111111111111",
+            "onnx/other.onnx",
+            768,
+        )
+        .expect("valid spec");
+        assert_eq!(identity(&renamed, false).id(), reference.id());
+
+        // changed bytes must change the id
+        assert_ne!(
+            ModelIdentity::new(&base, "other-content".to_string(), false).id(),
+            reference.id()
+        );
+    }
+
+    #[test]
+    fn identity_id_changes_with_every_vector_shaping_field() {
         let base = spec();
         let reference = identity(&base, false);
 
@@ -1079,8 +1070,8 @@ mod tests {
                 .with_prefixes(&Prefixes::new("", "search_document: ")),
         ] {
             assert_ne!(
-                identity(&changed, false),
-                reference,
+                identity(&changed, false).id(),
+                reference.id(),
                 "the digest must cover output, pooling, quantization and both prefixes"
             );
         }
@@ -1090,15 +1081,37 @@ mod tests {
     }
 
     #[test]
+    fn identity_display_and_mrl_source() {
+        let truncated = spec().with_truncated_dims(TruncatedDims::new(256).expect("256 ok"));
+
+        let from_meta = identity(&truncated, true);
+        assert_eq!(from_meta.mrl_source(), Some(MrlSource::Metadata));
+        assert_eq!(from_meta.dim(), 256);
+        assert!(from_meta.to_string().contains("#d256+c"));
+        assert!(from_meta.to_string().ends_with("/meta"));
+
+        let from_spec = identity(&truncated, false);
+        assert_eq!(from_spec.mrl_source(), Some(MrlSource::Spec));
+        assert!(from_spec.to_string().ends_with("/spec"));
+        assert_ne!(from_meta.id(), from_spec.id());
+    }
+
+    #[test]
     fn fake_embedder_reports_effective_and_native_widths() {
         let plain = Embedder::fake(64);
         assert_eq!(plain.dim(), 64);
         assert_eq!(plain.native_dim(), 64);
-        assert_eq!(plain.model_id(), FAKE_MODEL_ID);
+        assert_eq!(plain.identity().repo(), "fake");
+        assert_eq!(plain.identity().dim(), 64);
 
         let truncated = Embedder::fake_truncated(64, TruncatedDims::new(32).expect("32 ok"));
         assert_eq!(truncated.dim(), 32, "effective width");
         assert_eq!(truncated.native_dim(), 64, "native width is unchanged");
+        assert_eq!(
+            truncated.identity().dim(),
+            32,
+            "identity carries the effective width"
+        );
     }
 
     // ---- truncation -------------------------------------------------------------------
@@ -1146,11 +1159,16 @@ mod tests {
             .expect("loads and passes every guard");
         assert_eq!(full.native_dim(), 768);
         assert_eq!(full.dim(), 768);
-        assert!(
-            full.model_id()
-                .starts_with(&format!("{REPO}/onnx/model_quantized.onnx@{REV}#d768+c")),
+        assert_eq!(full.identity().repo(), REPO);
+        assert_eq!(full.identity().file(), "onnx/model_quantized.onnx");
+        assert_eq!(full.identity().revision(), REV);
+        assert_eq!(full.identity().dim(), 768);
+        assert_eq!(full.identity().mrl_source(), None);
+        assert_eq!(
+            full.identity().id().len(),
+            32,
             "identity: {}",
-            full.model_id()
+            full.identity()
         );
 
         let truncated = Embedder::load(
@@ -1160,10 +1178,12 @@ mod tests {
         .await
         .expect("256 is declared in matryoshka_dimensions");
         assert_eq!(truncated.dim(), 256);
-        assert!(
-            truncated.model_id().contains("#d256+c") && truncated.model_id().ends_with("/meta"),
+        assert_eq!(
+            truncated.identity().mrl_source(),
+            Some(MrlSource::Metadata),
             "width authorised by the artifact's own matryoshka_dimensions"
         );
+        assert_eq!(truncated.identity().dim(), 256);
 
         let full_vector = full
             .embed_query("pricing a b2b newsletter")

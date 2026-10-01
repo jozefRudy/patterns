@@ -23,11 +23,15 @@ pub enum Pooling {
 
 /// Input to fastembed's batching rule: `Dynamic` means one call must not be split into batches
 /// (per-batch activation ranges differ, so embeddings would not be comparable across batches).
+///
+/// `Static` is deliberately absent: it is runtime-identical to `None` (fastembed's batch-size match
+/// treats every non-`Dynamic` mode the same, and the ORT session never sees the mode), so the
+/// distinction buys nothing but a footgun. If a dependency bump ever makes them diverge, the
+/// `static_enum_and_none_spec_produce_identical_vectors` test fails and a mode must return.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Quantization {
     #[default]
     None,
-    Static,
     Dynamic,
 }
 
@@ -216,7 +220,6 @@ impl From<Quantization> for fastembed::QuantizationMode {
     fn from(quantization: Quantization) -> Self {
         match quantization {
             Quantization::None => Self::None,
-            Quantization::Static => Self::Static,
             Quantization::Dynamic => Self::Dynamic,
         }
     }
@@ -249,10 +252,6 @@ mod tests {
         assert_eq!(
             fastembed::QuantizationMode::from(Quantization::None),
             fastembed::QuantizationMode::None
-        );
-        assert_eq!(
-            fastembed::QuantizationMode::from(Quantization::Static),
-            fastembed::QuantizationMode::Static
         );
         assert_eq!(
             fastembed::QuantizationMode::from(Quantization::Dynamic),

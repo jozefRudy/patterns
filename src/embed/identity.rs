@@ -216,7 +216,6 @@ fn spec_digest(spec: &ModelSpec) -> String {
     };
     let quantization = match spec.quantization() {
         Quantization::None => "none",
-        Quantization::Static => "static",
         Quantization::Dynamic => "dynamic",
     };
     digest_parts(

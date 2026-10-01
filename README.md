@@ -57,7 +57,7 @@ Background — why the model is a spec you write rather than a name from fastemb
 and what that buys: [A Loader on Top of fastembed](https://jozefrudy.com/fastembed-model-table/).
 
 ```rust
-use patterns::embed::{Embedder, LoadOptions, ModelSpec, Pooling, Prefixes};
+use patterns::embed::{Embedder, LoadOptions, ModelSpec, Pooling, Prefixes, Quantization};
 
 // a model is a spec: repo + pinned commit + artifact file + native width, plus how the
 // artifact becomes a vector (its output, pooling, MRL width) and its trained prefixes.
@@ -69,7 +69,11 @@ let spec = ModelSpec::new(
     1024,
 )?
 .with_pooling(Pooling::Cls)                  // 3-D graph output ⇒ declare how we reduce it
-.with_prefixes(&Prefixes::new("", ""));     // mxbai is symmetric; asymmetric models pass theirs
+.with_quantization(Quantization::Dynamic)    // int8 artifact ⇒ never split a call (see load)
+.with_prefixes(&Prefixes::new(
+    "Represent this sentence for searching relevant passages: ", // query prompt
+    "",                                                          // document side
+));                                          // mxbai is asymmetric; symmetric models pass ("", "")
 
 // `LoadOptions` carries only runtime policy (threads, download progress)
 let embedder = Embedder::load(
@@ -128,6 +132,12 @@ Design:
   (query + bulk). That's capacity policy, so it stays a consumer decision
 - `Embedder::fake(dim)` returns deterministic hash vectors for tests of
   embedding-adjacent logic (stores, ranking) without a model download
+- **quantization** is `{None, Dynamic}` only. `Dynamic` means the artifact quantizes activations
+  per run, so fastembed must embed a call in **one** ONNX run. `Static` is deliberately absent:
+  fastembed treats every non-`Dynamic` mode identically (the mode never reaches the ONNX session),
+  so `Static` was a no-op label, not a behaviour. Load **verifies** the spec against the artifact
+  behaviourally: it embeds the probe text alone and then inside a batch; batch-variance must match
+  `Dynamic`, else load fails (this is what catches a spec that forgot `.with_quantization`).
 - **identity** (`embedder.identity()`): a `ModelIdentity` whose compact `id()` is keyed only on what
   can reshape the token stream — the exact model, the spec choices
   (output/pooling/quantization/prefixes), the stored width + MRL source, and the tokenizer version.

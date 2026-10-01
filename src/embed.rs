@@ -467,32 +467,21 @@ fn load_blocking(
         artifact.matryoshka_dims.as_deref(),
     )?;
 
-    let identity = ModelIdentity::new(spec, artifact.content_hash, selected.mrl_from_metadata);
-    let mut model = UserDefinedEmbeddingModel::new(artifact.onnx, artifact.tokenizer_files)
-        .with_quantization(spec.quantization().into());
-    if let Some(pooling) = selected.pooling {
-        model = model.with_pooling(pooling.into());
-    }
-    // Always name the output explicitly, so fastembed's precedence list (which ranks
-    // `last_hidden_state` above `sentence_embedding`) is never consulted. `OutputKey::ByName`
-    // takes `&'static str`; a graph-derived name is leaked once per load — a few bytes.
-    model.output_key = Some(OutputKey::ByName(match spec.output() {
-        Some(name) => name,
-        None => Box::leak(selected.name.into_boxed_str()),
-    }));
+    let content_hash = artifact.content_hash.clone();
+    let mut embedder = build_text_embedding(
+        artifact,
+        spec,
+        &selected,
+        spec.quantization().into(),
+        intra_threads,
+    )?;
+    let identity = ModelIdentity::new(spec, content_hash, selected.mrl_from_metadata);
 
-    let mut options = InitOptionsUserDefined::new().with_max_length(artifact.max_length);
-    if let Some(threads) = intra_threads {
-        options = options.with_intra_threads(threads);
-    }
-    let mut embedder = TextEmbedding::try_new_from_user_defined(model, options)
-        .context("build the embedding session")?;
-
-    let probe = embedder.embed(["probe"], None).context("probe embed")?;
-    let native_dim = probe
+    let probe = embedder.embed([PROBE_TEXT], None).context("probe embed")?;
+    let solo = probe
         .first()
-        .ok_or_else(|| anyhow!("the model returned no probe embedding"))?
-        .len();
+        .ok_or_else(|| anyhow!("the model returned no probe embedding"))?;
+    let native_dim = solo.len();
     ensure!(
         native_dim == spec.native_dim(),
         "native width {native_dim} does not match the declared dim {}",
@@ -501,6 +490,19 @@ fn load_blocking(
     ensure!(
         native_dim % 8 == 0,
         "native width {native_dim} is not a multiple of 8 (8 sign bits per byte)"
+    );
+    // batch-variance probe: batch-invariant = Static/None/fp32; batch-variant = Dynamic. The solo
+    // vector is already in hand, so this costs one extra inference.
+    let variant = probe_is_batch_variant(&mut embedder, solo)?;
+    ensure!(
+        variant == matches!(spec.quantization(), Quantization::Dynamic),
+        "quantization probe: model is batch-{} but spec declares {:?}",
+        if variant {
+            "variant (dynamic)"
+        } else {
+            "invariant"
+        },
+        spec.quantization()
     );
     if let Some(truncated) = spec.truncate_to() {
         ensure!(
@@ -524,6 +526,36 @@ fn load_blocking(
         identity,
         count_tokenizer,
     })
+}
+
+/// Build the fastembed handle from a fetched artifact. `mode` is the batching rule fastembed
+/// applies (see [`Quantization`]); the load path passes the spec's mode, tests pass another to
+/// compare behaviour over the same bytes.
+fn build_text_embedding(
+    artifact: hub::Artifact,
+    spec: &ModelSpec,
+    selected: &SelectedOutput,
+    mode: fastembed::QuantizationMode,
+    intra_threads: Option<usize>,
+) -> Result<TextEmbedding> {
+    let mut model = UserDefinedEmbeddingModel::new(artifact.onnx, artifact.tokenizer_files)
+        .with_quantization(mode);
+    if let Some(pooling) = selected.pooling {
+        model = model.with_pooling(pooling.into());
+    }
+    // Always name the output explicitly, so fastembed's precedence list (which ranks
+    // `last_hidden_state` above `sentence_embedding`) is never consulted. `OutputKey::ByName`
+    // takes `&'static str`; a graph-derived name is leaked once per load — a few bytes.
+    model.output_key = Some(OutputKey::ByName(match spec.output() {
+        Some(name) => name,
+        None => Box::leak(selected.name.clone().into_boxed_str()),
+    }));
+
+    let mut options = InitOptionsUserDefined::new().with_max_length(artifact.max_length);
+    if let Some(threads) = intra_threads {
+        options = options.with_intra_threads(threads);
+    }
+    TextEmbedding::try_new_from_user_defined(model, options).context("build the embedding session")
 }
 
 /// Read a graph's inputs and outputs (name + rank) without keeping a session alive.
@@ -583,6 +615,34 @@ struct SelectedOutput {
 
 /// Inputs fastembed feeds; a graph needing anything else cannot run in-process.
 const FEEDABLE_INPUTS: [&str; 3] = ["input_ids", "attention_mask", "token_type_ids"];
+
+/// Solo probe text for the batch-variance check (also the `native_dim` probe text).
+const PROBE_TEXT: &str = "probe";
+/// Second text, batched with [`PROBE_TEXT`], to expose per-batch activation ranges.
+const PROBE_PEER: &str = "a second probe text used to detect dynamic quantization";
+/// Max per-component difference above which the two probe embeddings are batch-variant
+/// (dynamic-quantization divergence is ~1e-2; fp32/static batching noise is ~1e-6).
+const PROBE_BATCH_TOLERANCE: f32 = 1e-3;
+
+/// Whether [`PROBE_TEXT`] embeds differently alone vs in a batch — the behavioral signature of a
+/// dynamically-quantized graph (per-run activation ranges).
+///
+/// # Errors
+/// On a failed probe inference.
+fn probe_is_batch_variant(embedder: &mut TextEmbedding, solo: &[f32]) -> Result<bool> {
+    let batched = embedder
+        .embed([PROBE_TEXT, PROBE_PEER], None)
+        .context("batch probe embed")?;
+    let peer = batched
+        .first()
+        .ok_or_else(|| anyhow!("the model returned no batch probe embedding"))?;
+    let divergence = solo
+        .iter()
+        .zip(peer)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f32, f32::max);
+    Ok(divergence > PROBE_BATCH_TOLERANCE)
+}
 
 /// Validate a loaded graph against the spec: input set, output selection, pooling, truncation.
 ///
@@ -1063,7 +1123,7 @@ mod tests {
         for changed in [
             base.clone().with_output("sentence_embedding"),
             base.clone().with_pooling(Pooling::Mean),
-            base.clone().with_quantization(Quantization::Static),
+            base.clone().with_quantization(Quantization::Dynamic),
             base.clone()
                 .with_prefixes(&Prefixes::new("search_query: ", "")),
             base.clone()
@@ -1141,6 +1201,96 @@ mod tests {
     }
 
     // ---- real model (#[ignore]: downloads + verifies at a pinned revision) -------------
+
+    /// Small model shared by the quantization tests (`Xenova/all-MiniLM-L6-v2`, 384-d).
+    const MINILM_REPO: &str = "Xenova/all-MiniLM-L6-v2";
+    const MINILM_REV: &str = "751bff37182d3f1213fa05d7196b954e230abad9";
+
+    /// fp32 `MiniLM` spec — the non-`Dynamic` (`None`) side.
+    fn minilm_fp32_spec() -> ModelSpec {
+        ModelSpec::new(MINILM_REPO, MINILM_REV, "onnx/model.onnx", 384)
+            .expect("valid spec")
+            .with_pooling(Pooling::Mean)
+    }
+
+    /// Quantized `MiniLM` spec — the `Dynamic` side.
+    fn minilm_q_spec() -> ModelSpec {
+        ModelSpec::new(MINILM_REPO, MINILM_REV, "onnx/model_quantized.onnx", 384)
+            .expect("valid spec")
+            .with_pooling(Pooling::Mean)
+            .with_quantization(Quantization::Dynamic)
+    }
+
+    /// Fetch + build a raw fastembed handle for `spec` under an explicit `mode` (the load path
+    /// passes the spec's own mode; these tests force another over the same bytes).
+    fn raw_embedding(spec: &ModelSpec, mode: fastembed::QuantizationMode) -> Result<TextEmbedding> {
+        let dir = std::env::temp_dir().join("patterns_embed_hub_tests");
+        std::fs::create_dir_all(&dir).context("test cache dir")?;
+        let client = hub::HubFiles::new(dir, false)?;
+        let artifact = hub::fetch(&client, spec)?;
+        let desc = graph_desc(&artifact.onnx)?;
+        let selected = validate_graph(
+            &desc,
+            spec,
+            artifact.pooling_meta.as_ref(),
+            artifact.matryoshka_dims.as_deref(),
+        )?;
+        build_text_embedding(artifact, spec, &selected, mode, None)
+    }
+
+    /// Run the probe on a raw handle.
+    fn probe_once(te: &mut TextEmbedding) -> bool {
+        let solo = te.embed([PROBE_TEXT], None).expect("solo probe").remove(0);
+        probe_is_batch_variant(te, &solo).expect("probe")
+    }
+
+    #[tokio::test]
+    #[ignore = "downloads the artifact from the hub"]
+    async fn probe_flags_a_dynamic_model() {
+        // MiniLM int8 is Dynamic: embedding alone vs in a batch must differ.
+        let mut te = raw_embedding(&minilm_q_spec(), fastembed::QuantizationMode::Dynamic)
+            .expect("load dynamic model");
+        assert!(probe_once(&mut te), "dynamic model must be batch-variant");
+    }
+
+    #[tokio::test]
+    #[ignore = "downloads the artifact from the hub"]
+    async fn probe_passes_a_static_quantized_model() {
+        // fp32 (non-Dynamic) model: batching must not change the vector.
+        let mut te = raw_embedding(&minilm_fp32_spec(), fastembed::QuantizationMode::None)
+            .expect("load fp32 model");
+        assert!(
+            !probe_once(&mut te),
+            "non-dynamic model must be batch-invariant"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "downloads the artifact from the hub"]
+    async fn static_enum_and_none_spec_produce_identical_vectors() {
+        // Collapse guard: fastembed's `Static` mode must be behaviourally identical to `None`
+        // (same bytes, only the mode differs). If they ever diverge, a distinct mode must return.
+        let spec = minilm_fp32_spec();
+        let mut stat = raw_embedding(&spec, fastembed::QuantizationMode::Static).expect("static");
+        let mut none = raw_embedding(&spec, fastembed::QuantizationMode::None).expect("none");
+        let texts = [
+            "rust ownership and lifetimes",
+            "a recipe for chocolate cake",
+        ];
+        let a = stat.embed(texts, None).expect("static embed");
+        let b = none.embed(texts, None).expect("none embed");
+        let bits = |rows: &[Vec<f32>]| {
+            rows.iter()
+                .flatten()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            bits(&a),
+            bits(&b),
+            "Static and None must produce bit-identical vectors"
+        );
+    }
 
     #[tokio::test]
     #[ignore = "downloads the artifact from the hub"]

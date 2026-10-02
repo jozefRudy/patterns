@@ -87,7 +87,7 @@ let identity = embedder.identity();
 identity.id();            // the key to store per vector: 32 hex, filesystem/SQL-safe
                           // Keyed only on what can change the vector — exact model, spec
                           // (output/pooling/quantization/prefixes), width, tokenizer version.
-                          // Labels (revision/repo/file) and execution crates (fastembed/ort/ndarray)
+                          // Labels (revision/repo/file) and execution crates (fastembed/ort)
                           // are excluded, so their bumps do not force a re-embed.
 // display (human form, NOT the key): {repo}/{file}@{revision}#d{dim}+c{spec_digest}+e{engine_digest}[/meta|/spec]
 
@@ -141,7 +141,7 @@ Design:
 - **identity** (`embedder.identity()`): a `ModelIdentity` whose compact `id()` is keyed only on what
   can reshape the token stream — the exact model, the spec choices
   (output/pooling/quantization/prefixes), the stored width + MRL source, and the tokenizer version.
-  The git revision, repo/file name, and execution crates (`fastembed`, `ort`, `ndarray`) are **not**
+  The git revision, repo/file name, and execution crates (`fastembed`, `ort`) are **not**
   in `id()`. Identical bytes over the same pins reuse the same `id`; anything that can reshape the
   token stream yields a new `id` — the signal to re-embed. Store `id()` beside each vector.
 

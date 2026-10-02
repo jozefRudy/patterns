@@ -1,69 +1,84 @@
 //! Bakes crate versions into the model identity: the tokenizer (which decides the token stream) is
 //! part of `id()`; the rest are recorded for inspection only, so an execution-crate bump does not
-//! force a re-embed. Reads `Cargo.lock` because versions are not available at runtime.
+//! force a re-embed.
+//!
+//! Reads `Cargo.toml`, not `Cargo.lock`: a vendored dependency (cargo vendor, nix/crane) ships the
+//! manifest but never a lockfile, so a lockfile read fails every sandboxed consumer build. The
+//! engine/tokenizer deps are exact-pinned (`=x.y.z`) in the manifest, so the declared version
+//! equals the resolved one — deterministic without a lockfile.
 
 use std::env;
 use std::fs;
 use std::path::Path;
 
 /// Execution crates: cannot change the vector beyond float-level noise (inspection only).
-const ENGINE: [&str; 3] = ["fastembed", "ort", "ndarray"];
+const ENGINE: [&str; 2] = ["fastembed", "ort"];
 
 /// The one engine crate in `id()`: a bump can change the token stream, not just float bits.
 const TOKENIZER: &str = "tokenizers";
 
-fn main() {
-    println!("cargo:rerun-if-changed=Cargo.lock");
-    let manifest = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by cargo");
-    let lock = fs::read_to_string(Path::new(&manifest).join("Cargo.lock"))
-        .expect("Cargo.lock sits next to Cargo.toml");
+fn main() -> Result<(), String> {
+    println!("cargo:rerun-if-changed=Cargo.toml");
+    let manifest_dir =
+        env::var("CARGO_MANIFEST_DIR").map_err(|err| format!("CARGO_MANIFEST_DIR: {err}"))?;
+    let text = fs::read_to_string(Path::new(&manifest_dir).join("Cargo.toml"))
+        .map_err(|err| format!("read Cargo.toml: {err}"))?;
+    let manifest: toml::Value =
+        toml::from_str(&text).map_err(|err| format!("parse Cargo.toml: {err}"))?;
     println!(
         "cargo:rustc-env=PATTERNS_ENGINE_FINGERPRINT={}",
-        fingerprint(&lock, &ENGINE)
+        fingerprint(&manifest, &ENGINE)?
     );
     println!(
         "cargo:rustc-env=PATTERNS_TOKENIZER_FINGERPRINT={}",
-        fingerprint(&lock, &[TOKENIZER])
+        fingerprint(&manifest, &[TOKENIZER])?
     );
+    Ok(())
 }
 
-/// `name=version@checksum8` per name, joined by `;`.
-fn fingerprint(lock: &str, names: &[&str]) -> String {
+/// `name=version` per name, joined by `;`.
+fn fingerprint(manifest: &toml::Value, names: &[&str]) -> Result<String, String> {
     names
         .iter()
-        .map(|name| {
-            let (version, checksum) = package(lock, name);
-            let short = checksum.map_or_else(String::new, |hash| hash.chars().take(8).collect());
-            format!("{name}={version}@{short}")
-        })
-        .collect::<Vec<_>>()
-        .join(";")
+        .map(|name| Ok(format!("{name}={}", exact_version(manifest, name)?)))
+        .collect::<Result<Vec<_>, String>>()
+        .map(|parts| parts.join(";"))
 }
 
-/// `(version, checksum)` for `name`, from its `[[package]]` block (empty when absent).
-fn package(lock: &str, name: &str) -> (String, Option<String>) {
-    for block in lock.split("[[package]]") {
-        let mut block_name = String::new();
-        let mut version = String::new();
-        let mut checksum = None;
-        for line in block.lines().map(str::trim) {
-            if let Some(value) = field(line, "name") {
-                block_name = value;
-            } else if let Some(value) = field(line, "version") {
-                version = value;
-            } else if let Some(value) = field(line, "checksum") {
-                checksum = Some(value);
-            }
+/// The exact version declared for `dependencies.<name>` (a leading `=` is fine).
+///
+/// Errors unless the crate is a direct dependency with an exact (`x.y.z`) version:
+/// a caret/range would not fix the resolved crate, so the identity would not be
+/// reproducible.
+fn exact_version(manifest: &toml::Value, name: &str) -> Result<String, String> {
+    let dep = manifest
+        .get("dependencies")
+        .and_then(|deps| deps.get(name))
+        .ok_or_else(|| format!("`{name}` must be a direct dependency"))?;
+    let declared = match dep {
+        toml::Value::String(version) => version.clone(),
+        toml::Value::Table(table) => table
+            .get("version")
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| format!("`{name}` needs an explicit `version`"))?
+            .to_string(),
+        other => {
+            return Err(format!(
+                "`{name}` has an unsupported dependency form: {other:?}"
+            ));
         }
-        if block_name == name {
-            return (version, checksum);
-        }
+    };
+    let version = declared.strip_prefix('=').unwrap_or(&declared);
+    let parts: Vec<&str> = version.split('.').collect();
+    let exact = parts.len() >= 3
+        && parts
+            .iter()
+            .take(3)
+            .all(|part| part.chars().next().is_some_and(|c| c.is_ascii_digit()));
+    if !exact {
+        return Err(format!(
+            "`{name}` must be exact-pinned (`=x.y.z`), got `{version}`"
+        ));
     }
-    (String::new(), None)
-}
-
-/// Value of a `key = "value"` lockfile line, when `line` is that key.
-fn field(line: &str, key: &str) -> Option<String> {
-    let rest = line.strip_prefix(key)?.strip_prefix(" = ")?;
-    Some(rest.trim_matches('"').to_string())
+    Ok(version.to_string())
 }

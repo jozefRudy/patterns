@@ -19,7 +19,7 @@ tokio = { version = "1", features = ["process", "sync", "time"] }
 fastembed = { version = "=6.1.0", default-features = false, features = ["ort-download-binaries-native-tls", "hf-hub-native-tls"], optional = true }
 lingua = { version = "1.8.0", default-features = false, features = ["english", "french", "german", "spanish", "polish"], optional = true }
 # count-only tokenizer access (lock-free) — version pinned to fastembed's
-tokenizers = { version = "0.23", default-features = false, optional = true }
+tokenizers = { version = "=0.23.2", default-features = false, optional = true }
 hf-hub = { version = "0.5", default-features = false, optional = true }
 sha2 = { version = "0.11", optional = true }
 sha1 = { version = "0.11", optional = true }
@@ -43,6 +43,11 @@ embed = [
 embed_api = ["dep:reqwest", "dep:tokenizers", "tokenizers/fancy-regex", "dep:hf-hub", "hf-hub/ureq", "hf-hub/native-tls"]
 language = ["dep:lingua"]
 systemone = ["templating", "derives", "dep:reqwest"]
+
+[build-dependencies]
+# build.rs reads the manifest for the exact engine/tokenizer versions (a vendored
+# dependency ships Cargo.toml but never Cargo.lock).
+toml = "1"
 
 [dev-dependencies]
 libc = "0.2"

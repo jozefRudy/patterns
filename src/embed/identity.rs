@@ -2,7 +2,7 @@
 //!
 //! `id()` is keyed only on what can reshape the token stream — the verified bytes, the spec choices,
 //! the stored width and the tokenizer version. The revision pin, the repo/artifact name and the
-//! execution crates (`fastembed`, `ort`, `ndarray`) are deliberately excluded: they cannot change the
+//! execution crates (`fastembed`, `ort`) are deliberately excluded: they cannot change the
 //! vectors beyond float-level noise, so a bump must not force a re-embed.
 
 use std::fmt;
@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use super::spec::{ModelSpec, Pooling, Quantization, TruncatedDims};
 use crate::prefixes::Prefixes;
 
-/// Engine crate versions, baked at build time from `Cargo.lock` (see `build.rs`); inspection only.
+/// Engine crate versions, baked at build time from `Cargo.toml` (see `build.rs`); inspection only.
 const ENGINE_FINGERPRINT: &str = env!("PATTERNS_ENGINE_FINGERPRINT");
 
 /// Tokenizer version: the one engine crate in `id()`, since it decides the token stream.
@@ -65,7 +65,7 @@ pub struct ModelIdentity {
     spec_digest: String,
     /// `tokenizers` version — the only engine crate in `id()`.
     tokenizer_digest: String,
-    /// `fastembed`/`ort`/`ndarray` versions — inspection only, not in `id()`.
+    /// `fastembed`/`ort` versions — inspection only, not in `id()`.
     engine_digest: String,
     mrl_source: Option<MrlSource>,
     id: String,

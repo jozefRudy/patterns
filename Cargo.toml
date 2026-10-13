@@ -118,6 +118,7 @@ required-features = ["systemone"]
 # ort/ONNX statically linked into every test binary — full debug info makes
 # each rebuild churn GBs; line tables keep backtraces useful at a fraction of the size
 debug = "line-tables-only"
+split-debuginfo = "unpacked"
 
 [profile.dev.build-override]
 # build scripts + proc macros: compiled once (sccache), run on every build

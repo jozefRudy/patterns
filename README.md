@@ -12,9 +12,10 @@ Modules (feature-gated; `default = ["llm_cli", "embed", "embed_api", "language",
   struct (`#[derive(Extractable)]` + `#[extract(template = "…", healthcheck = "…")]`);
   template files stay in consumers.
 - `embed` (feature `embed`) — text embeddings via fastembed (ONNX, CPU,
-  in-process) for any pinned, content-verified `ModelSpec`. Thread count at load;
+  in-process) for any pinned, content-verified `EmbeddingSpec`. Thread count at load;
   a model's query/document prefixes travel with its spec, and the query/document
-  methods apply them automatically.
+  methods apply them automatically. Also a cross-encoder `Reranker` (same pinned
+  fetch) that scores `(query, doc)` pairs for second-stage reranking.
 - `language` (feature `language`) — English text detection via lingua.
   Process-wide singleton detector (`OnceLock<Arc<...>>` — memory optimization:
   preloaded language models load exactly once, shared by all instances; no
@@ -45,7 +46,7 @@ Deps with versions that matter are pinned exactly in this crate
 (`fastembed =6.1.0`, `ort =2.0.0-rc.13` — which transitively pins a
 sha256-verified ONNX Runtime binary). `patterns::ort` and `patterns::askama`
 are re-exported so consumers never declare them separately; `fastembed` is
-internal to `embed` — models are described by `patterns::embed::ModelSpec`,
+internal to `embed` — models are described by `patterns::embed::EmbeddingSpec`,
 whose enum mirrors (`Pooling`, `Quantization`, `TruncatedDims`) keep fastembed
 types out of the API.
 `patterns-macros` is an internal workspace member (path dependency) re-exported
@@ -57,12 +58,12 @@ Background — why the model is a spec you write rather than a name from fastemb
 and what that buys: [A Loader on Top of fastembed](https://jozefrudy.com/fastembed-model-table/).
 
 ```rust
-use patterns::embed::{Embedder, LoadOptions, ModelSpec, Pooling, Prefixes, Quantization};
+use patterns::embed::{Embedder, LoadOptions, EmbeddingSpec, Pooling, Prefixes, Quantization};
 
 // a model is a spec: repo + pinned commit + artifact file + native width, plus how the
 // artifact becomes a vector (its output, pooling, MRL width) and its trained prefixes.
 // Load verifies the bytes against the hub's own content hashes and refuses to fall back.
-let spec = ModelSpec::new(
+let spec = EmbeddingSpec::new(
     "mixedbread-ai/mxbai-embed-large-v1",
     "b33106f585b9ce46904ad7443a3b52b7a63e231c",
     "onnx/model_quantized.onnx",
@@ -106,7 +107,7 @@ let skipped = (0..texts.len()).filter(|ix| !seen.contains(ix));  // below min_to
 ```
 
 Design:
-- **prefixes are model config**, part of the `ModelSpec`, applied by `embed_query` and the chunked
+- **prefixes are model config**, part of the `EmbeddingSpec`, applied by `embed_query` and the chunked
   document methods — no prefix logic at call sites
 - **chunking is forced for documents**: tokenizer-exact, boundary-aware
   (paragraph → sentence → whitespace), with overlap and a no-tail-loss
@@ -144,6 +145,45 @@ Design:
   The git revision, repo/file name, and execution crates (`fastembed`, `ort`) are **not**
   in `id()`. Identical bytes over the same pins reuse the same `id`; anything that can reshape the
   token stream yields a new `id` — the signal to re-embed. Store `id()` beside each vector.
+
+### Reranker
+
+A cross-encoder: it scores a `(query, doc)` pair *together*, which neither BM25 nor a
+bi-encoder embedding can do. Use it as the second stage — rerank a candidate list before a
+final (more expensive) judge. Same pinned, content-verified fetch as the embedder.
+
+```rust
+use patterns::embed::{HubSpec, LoadOptions, Reranker, RerankHit};
+
+// a reranker is just its hub coordinates: repo + pinned commit + ONNX file.
+let spec = HubSpec::new(
+    "jinaai/jina-reranker-v1-turbo-en",
+    "b8c14f4e723d9e0aab4732a7b7b93741eeeb77c2",
+    "onnx/model.onnx",
+)?;
+
+let reranker = Reranker::load(
+    LoadOptions::new(spec).with_intra_threads(4),
+    &cache_dir,
+).await?;
+
+// rerank(query, docs, batch_size) -> Vec<RerankHit { index, score }>, sorted by score desc
+let hits: Vec<RerankHit> = reranker.rerank("rust async runtime", &documents, None)?;
+// hits[0].index -> documents[hits[0].index]
+```
+
+Design:
+- **any cross-encoder ONNX works** — repo + pinned commit + file, standard HF layout
+  (`input_ids` / `attention_mask` in, `logits` out, the four tokenizer files). No preset enum:
+  `bge-reranker-*`, `jina-reranker-*`, `mxbai-rerank-*`, `gte-reranker-*`, or a fine-tune.
+- **same fetch/verify as the embedder** (`hub::fetch`, keyed on `HubSpec`): revision pinned, bytes
+  verified against the hub's own content hashes, never a fallback.
+- **`rerank` is blocking** (ONNX runs under a shared lock, not concurrently safe): call from
+  `spawn_blocking`. One handle serializes its callers.
+- **the score is raw** — a logit for `bge-reranker`, bounded for `jina` — *not* a calibrated
+  probability. Bar it relative to the best (`score >= alpha * max`), or calibrate before using an
+  absolute threshold.
+- `Reranker::fake(|query, doc| score)` returns caller-supplied scores for tests, no download.
 
 
 ## `embed_api` usage

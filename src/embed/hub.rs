@@ -21,7 +21,7 @@ use sha1::Sha1;
 use sha2::{Digest, Sha256};
 
 use crate::embed::PoolingMeta;
-use crate::embed::spec::ModelSpec;
+use crate::embed::spec::HubSpec;
 
 /// `1_Pooling/config.json` — present in sentence-transformers-format repos only.
 const POOLING_FILE: &str = "1_Pooling/config.json";
@@ -184,13 +184,15 @@ struct LfsEntry {
     sha256: String,
 }
 
-/// Fetch and verify everything the load path needs for `spec`.
+/// Fetch and verify everything a load path needs for `spec` — shared by the
+/// embedder and the reranker. The embedder-only [`Artifact`] fields simply go
+/// unread by the reranker.
 ///
 /// # Errors
 /// A missing required file, a content-hash mismatch against the hub's own listing, or unparseable
 /// `config.json` / `tokenizer_config.json` / `1_Pooling/config.json`. Never falls back to another
 /// model: rows are keyed by the identity of what was actually loaded.
-pub(super) fn fetch<C: HubClient>(client: &C, spec: &ModelSpec) -> Result<Artifact> {
+pub(super) fn fetch<C: HubClient>(client: &C, spec: &HubSpec) -> Result<Artifact> {
     let tree = client.tree(spec.repo(), spec.revision())?;
     ensure!(
         !tree.is_empty(),
@@ -201,7 +203,8 @@ pub(super) fn fetch<C: HubClient>(client: &C, spec: &ModelSpec) -> Result<Artifa
 
     let mut reads = Reads {
         client,
-        spec,
+        repo: spec.repo(),
+        revision: spec.revision(),
         tree: &tree,
         hashes: BTreeMap::new(),
     };
@@ -234,7 +237,8 @@ pub(super) fn fetch<C: HubClient>(client: &C, spec: &ModelSpec) -> Result<Artifa
 /// Reads (and verifies) required files, recording each file's content sha256 for the fingerprint.
 struct Reads<'a, C: HubClient> {
     client: &'a C,
-    spec: &'a ModelSpec,
+    repo: &'a str,
+    revision: &'a str,
     tree: &'a BTreeMap<String, TreeHash>,
     /// `path -> sha256(content)`, in path order.
     hashes: BTreeMap<String, String>,
@@ -246,13 +250,11 @@ impl<C: HubClient> Reads<'_, C> {
         let expected = self.tree.get(file).ok_or_else(|| {
             anyhow!(
                 "{}@{}: `{file}` is not in the repo",
-                self.spec.repo(),
-                self.spec.revision()
+                self.repo,
+                self.revision
             )
         })?;
-        let bytes = self
-            .client
-            .bytes(self.spec.repo(), self.spec.revision(), file)?;
+        let bytes = self.client.bytes(self.repo, self.revision, file)?;
         verify(file, &bytes, expected)?;
         self.hashes
             .insert(file.to_string(), hex(&Sha256::digest(&bytes)));
@@ -394,6 +396,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::embed::spec::EmbeddingSpec;
 
     const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
     const ONNX: &str = "onnx/model_quantized.onnx";
@@ -457,8 +460,8 @@ mod tests {
             )
     }
 
-    fn spec() -> ModelSpec {
-        ModelSpec::new("org/repo", SHA, ONNX, 768).expect("valid spec")
+    fn spec() -> EmbeddingSpec {
+        EmbeddingSpec::new("org/repo", SHA, ONNX, 768).expect("valid spec")
     }
 
     #[test]
@@ -509,7 +512,7 @@ mod tests {
             ..FakeHub::default()
         })
         .with("org/repo", ONNX, b"onnx-bytes");
-        let artifact = fetch(&hub, &spec()).expect("fetch");
+        let artifact = fetch(&hub, spec().hub()).expect("fetch");
         assert_eq!(artifact.onnx, b"onnx-bytes");
         assert_eq!(artifact.max_length, 512);
         assert_eq!(artifact.matryoshka_dims, Some(vec![256]));
@@ -525,7 +528,7 @@ mod tests {
                 ..FakeHub::default()
             })
             .with("org/repo", ONNX, body);
-            fetch(&hub, &spec()).expect("fetch").content_hash
+            fetch(&hub, spec().hub()).expect("fetch").content_hash
         };
         let reference = build(b"onnx-bytes");
         assert_eq!(build(b"onnx-bytes"), reference, "same bytes -> same hash");
@@ -536,7 +539,7 @@ mod tests {
         );
 
         // a different revision that resolves to the same bytes must not change the fingerprint
-        let other_revision = ModelSpec::new(
+        let other_revision = EmbeddingSpec::new(
             "org/repo",
             "1111111111111111111111111111111111111111",
             ONNX,
@@ -549,7 +552,9 @@ mod tests {
         })
         .with("org/repo", ONNX, b"onnx-bytes");
         assert_eq!(
-            fetch(&hub, &other_revision).expect("fetch").content_hash,
+            fetch(&hub, other_revision.hub())
+                .expect("fetch")
+                .content_hash,
             reference
         );
     }
@@ -594,7 +599,7 @@ mod tests {
             "tokenizer_config.json",
             br#"{"model_max_length":8192}"#,
         );
-        let artifact = fetch(&hub, &spec()).expect("fetch");
+        let artifact = fetch(&hub, spec().hub()).expect("fetch");
         assert_eq!(artifact.max_length, 2048);
     }
 
@@ -612,7 +617,7 @@ mod tests {
             "tokenizer_config.json",
             b"{\"model_max_length\":512}",
         );
-        let error = fetch(&hub, &spec())
+        let error = fetch(&hub, spec().hub())
             .err()
             .expect("tokenizer.json is missing");
         assert!(error.to_string().contains("tokenizer.json"), "{error}");
@@ -653,7 +658,7 @@ mod tests {
             inner: hub,
             body: b"tampered".to_vec(),
         };
-        let error = fetch(&tampered, &spec())
+        let error = fetch(&tampered, spec().hub())
             .err()
             .expect("sha256 must mismatch");
         assert!(error.to_string().contains("sha256 mismatch"), "{error}");
@@ -667,7 +672,7 @@ mod tests {
             ..FakeHub::default()
         })
         .with("org/repo", ONNX, b"onnx-bytes");
-        let artifact = fetch(&hub, &spec()).expect("git-tracked files verify via blob sha1");
+        let artifact = fetch(&hub, spec().hub()).expect("git-tracked files verify via blob sha1");
         assert_eq!(artifact.onnx, b"onnx-bytes");
     }
 
@@ -696,7 +701,7 @@ mod tests {
             ..FakeHub::default()
         })
         .with("org/repo", ONNX, b"onnx-bytes");
-        let error = fetch(&TamperedBlob { inner: hub }, &spec())
+        let error = fetch(&TamperedBlob { inner: hub }, spec().hub())
             .err()
             .expect("git blob sha1 must mismatch");
         assert!(
@@ -717,7 +722,7 @@ mod tests {
             POOLING_FILE,
             b"{\"pooling_mode_cls_token\":true,\"include_prompt\":false}",
         );
-        let artifact = fetch(&hub, &spec()).expect("fetch");
+        let artifact = fetch(&hub, spec().hub()).expect("fetch");
         let meta = artifact.pooling_meta.expect("1_Pooling parsed");
         assert!(meta.cls);
         assert!(!meta.mean);
@@ -726,7 +731,7 @@ mod tests {
 
     #[test]
     fn fetch_rejects_an_empty_listing() {
-        let error = fetch(&FakeHub::default(), &spec())
+        let error = fetch(&FakeHub::default(), spec().hub())
             .err()
             .expect("an empty listing must fail");
         assert!(error.to_string().contains("empty file listing"), "{error}");

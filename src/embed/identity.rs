@@ -10,7 +10,7 @@ use std::fmt::Write;
 
 use sha2::{Digest, Sha256};
 
-use super::spec::{ModelSpec, Pooling, Quantization, TruncatedDims};
+use super::spec::{EmbeddingSpec, Pooling, Quantization, TruncatedDims};
 use crate::prefixes::Prefixes;
 
 /// Engine crate versions, baked at build time from `Cargo.toml` (see `build.rs`); inspection only.
@@ -74,7 +74,7 @@ pub struct ModelIdentity {
 impl ModelIdentity {
     /// Identity of `spec`'s artifact, given the verified `content_hash` of its files and whether a
     /// truncated width came from the artifact metadata. `revision` is carried but excluded from `id`.
-    pub(super) fn new(spec: &ModelSpec, content_hash: String, mrl_from_metadata: bool) -> Self {
+    pub(super) fn new(spec: &EmbeddingSpec, content_hash: String, mrl_from_metadata: bool) -> Self {
         let dim = spec
             .truncate_to()
             .map_or_else(|| spec.native_dim(), TruncatedDims::get);
@@ -86,9 +86,9 @@ impl ModelIdentity {
             }
         });
         let mut identity = Self {
-            repo: spec.repo().to_string(),
-            file: spec.file().to_string(),
-            revision: spec.revision().to_string(),
+            repo: spec.hub().repo().to_string(),
+            file: spec.hub().file().to_string(),
+            revision: spec.hub().revision().to_string(),
             content_hash,
             dim,
             spec_digest: spec_digest(spec),
@@ -208,7 +208,7 @@ impl fmt::Display for ModelIdentity {
 }
 
 /// Digest of the vector-shaping spec choices; unset output/pooling render as `none`.
-fn spec_digest(spec: &ModelSpec) -> String {
+fn spec_digest(spec: &EmbeddingSpec) -> String {
     let pooling = match spec.pooling() {
         None => "none",
         Some(Pooling::Cls) => "cls",

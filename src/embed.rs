@@ -2,10 +2,10 @@
 //!
 //! Machinery: model loading, blocking-offload, batching, fake embedder for
 //! tests, and query/document prefix handling. The **prefixes are model configuration** and live
-//! on [`ModelSpec`] (e.g. `"search_query: "` / `"search_document: "` for nomic, `""`/`""` for
+//! on [`EmbeddingSpec`] (e.g. `"search_query: "` / `"search_document: "` for nomic, `""`/`""` for
 //! BGE-M3); `embed_query` and the chunked document methods apply them automatically.
 //!
-//! A model is described by one [`ModelSpec`]: repo + pinned revision + file, fetched and verified
+//! A model is described by one [`EmbeddingSpec`]: repo + pinned revision + file, fetched and verified
 //! at load, never taken from a fastembed table or a moving branch. Its identity is a
 //! [`ModelIdentity`]: a compact `id()` keyed on the verified bytes, the spec choices, the stored
 //! width and the tokenizer version — deliberately not on the revision, repo name or execution
@@ -13,7 +13,7 @@
 //! `Err` — never a silent model substitution, never a fallback model. Guard failure modes are
 //! documented on [`Embedder::load`].
 //!
-//! fastembed types never appear here: callers use [`ModelSpec`], [`Pooling`], [`Quantization`] and
+//! fastembed types never appear here: callers use [`EmbeddingSpec`], [`Pooling`], [`Quantization`] and
 //! [`TruncatedDims`], and `patterns::fastembed` is no longer re-exported — `patterns::ort` still
 //! is, since that re-export is what keeps a single ONNX Runtime linkage in the graph.
 
@@ -30,10 +30,12 @@ pub use crate::prefixes::Prefixes;
 
 mod hub;
 mod identity;
+mod rerank;
 pub mod spec;
 
 pub use identity::{ModelIdentity, MrlSource};
-pub use spec::{ModelSpec, Pooling, Quantization, TruncatedDims};
+pub use rerank::{RerankHit, Reranker};
+pub use spec::{EmbeddingSpec, HubSpec, Pooling, Quantization, TruncatedDims};
 
 /// Pooling flags parsed from the artifact repo's `1_Pooling/config.json`; `None` means the repo
 /// does not ship one (converted ONNX exports usually do not), in which case a declared pooling
@@ -54,11 +56,12 @@ struct PoolingMeta {
     include_prompt: Option<bool>,
 }
 
-/// Load-time configuration for [`Embedder`].
+/// Load-time configuration for [`Embedder`] (`S = EmbeddingSpec`) and [`Reranker`]
+/// (`S = HubSpec`).
 #[derive(Clone, Debug)]
-pub struct LoadOptions {
-    /// Which model to load; see [`ModelSpec`].
-    pub spec: ModelSpec,
+pub struct LoadOptions<S> {
+    /// Which artifact to load.
+    pub spec: S,
     /// ONNX intra-op thread count (`None` = all cores). Set below core
     /// count to leave CPU for other tasks.
     pub intra_threads: Option<usize>,
@@ -66,10 +69,10 @@ pub struct LoadOptions {
     pub show_download_progress: bool,
 }
 
-impl LoadOptions {
+impl<S> LoadOptions<S> {
     /// Defaults: all cores, download progress shown.
     #[must_use]
-    pub const fn new(spec: ModelSpec) -> Self {
+    pub const fn new(spec: S) -> Self {
         Self {
             spec,
             intra_threads: None,
@@ -141,7 +144,7 @@ impl Embedder {
     /// `1_Pooling/config.json`; `native_dim != spec.dim` or a native width not a multiple of 8;
     /// a truncated width that exceeds the native width or is absent from the declared
     /// `matryoshka_dimensions`. Never falls back to another model.
-    pub async fn load(options: LoadOptions, cache_dir: &Path) -> Result<Self> {
+    pub async fn load(options: LoadOptions<EmbeddingSpec>, cache_dir: &Path) -> Result<Self> {
         let LoadOptions {
             spec,
             intra_threads,
@@ -450,14 +453,14 @@ struct Loaded {
 
 /// Fetch → verify → build → guard. Blocking: hf-hub's API and ONNX Runtime are sync.
 fn load_blocking(
-    spec: &ModelSpec,
+    spec: &EmbeddingSpec,
     cache_dir: &Path,
     intra_threads: Option<usize>,
     show_download_progress: bool,
 ) -> Result<Loaded> {
     std::fs::create_dir_all(cache_dir).context("create the model cache dir")?;
     let client = hub::HubFiles::new(cache_dir.to_path_buf(), show_download_progress)?;
-    let artifact = hub::fetch(&client, spec)?;
+    let artifact = hub::fetch(&client, spec.hub())?;
 
     let desc = graph_desc(&artifact.onnx)?;
     let selected = validate_graph(
@@ -533,7 +536,7 @@ fn load_blocking(
 /// compare behaviour over the same bytes.
 fn build_text_embedding(
     artifact: hub::Artifact,
-    spec: &ModelSpec,
+    spec: &EmbeddingSpec,
     selected: &SelectedOutput,
     mode: fastembed::QuantizationMode,
     intra_threads: Option<usize>,
@@ -652,7 +655,7 @@ fn probe_is_batch_variant(embedder: &mut TextEmbedding, solo: &[f32]) -> Result<
 /// contradicts `pooling_meta`; a truncated width absent from the declared MRL widths.
 fn validate_graph(
     desc: &GraphDesc,
-    spec: &ModelSpec,
+    spec: &EmbeddingSpec,
     pooling_meta: Option<&PoolingMeta>,
     matryoshka_dims: Option<&[usize]>,
 ) -> Result<SelectedOutput> {
@@ -875,8 +878,8 @@ mod tests {
 
     const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
-    fn spec() -> ModelSpec {
-        ModelSpec::new("org/repo", SHA, "onnx/model.onnx", 768).expect("valid spec")
+    fn spec() -> EmbeddingSpec {
+        EmbeddingSpec::new("org/repo", SHA, "onnx/model.onnx", 768).expect("valid spec")
     }
 
     fn desc(inputs: &[&str], outputs: &[(&str, usize)]) -> GraphDesc {
@@ -1052,7 +1055,7 @@ mod tests {
 
     const CONTENT: &str = "content-hash";
 
-    fn identity(spec: &ModelSpec, mrl_from_metadata: bool) -> ModelIdentity {
+    fn identity(spec: &EmbeddingSpec, mrl_from_metadata: bool) -> ModelIdentity {
         ModelIdentity::new(spec, CONTENT.to_string(), mrl_from_metadata)
     }
 
@@ -1089,7 +1092,7 @@ mod tests {
         let reference = identity(&base, false);
 
         // a revision bump over identical bytes is a relabel: same id, no re-embed
-        let other_revision = ModelSpec::new(
+        let other_revision = EmbeddingSpec::new(
             "org/repo",
             "1111111111111111111111111111111111111111",
             "onnx/model.onnx",
@@ -1099,7 +1102,7 @@ mod tests {
         assert_eq!(identity(&other_revision, false).id(), reference.id());
 
         // repo/file are labels, not determinants: same content hash -> same id
-        let renamed = ModelSpec::new(
+        let renamed = EmbeddingSpec::new(
             "other/repo",
             "1111111111111111111111111111111111111111",
             "onnx/other.onnx",
@@ -1207,15 +1210,15 @@ mod tests {
     const MINILM_REV: &str = "751bff37182d3f1213fa05d7196b954e230abad9";
 
     /// fp32 `MiniLM` spec — the non-`Dynamic` (`None`) side.
-    fn minilm_fp32_spec() -> ModelSpec {
-        ModelSpec::new(MINILM_REPO, MINILM_REV, "onnx/model.onnx", 384)
+    fn minilm_fp32_spec() -> EmbeddingSpec {
+        EmbeddingSpec::new(MINILM_REPO, MINILM_REV, "onnx/model.onnx", 384)
             .expect("valid spec")
             .with_pooling(Pooling::Mean)
     }
 
     /// Quantized `MiniLM` spec — the `Dynamic` side.
-    fn minilm_q_spec() -> ModelSpec {
-        ModelSpec::new(MINILM_REPO, MINILM_REV, "onnx/model_quantized.onnx", 384)
+    fn minilm_q_spec() -> EmbeddingSpec {
+        EmbeddingSpec::new(MINILM_REPO, MINILM_REV, "onnx/model_quantized.onnx", 384)
             .expect("valid spec")
             .with_pooling(Pooling::Mean)
             .with_quantization(Quantization::Dynamic)
@@ -1223,11 +1226,14 @@ mod tests {
 
     /// Fetch + build a raw fastembed handle for `spec` under an explicit `mode` (the load path
     /// passes the spec's own mode; these tests force another over the same bytes).
-    fn raw_embedding(spec: &ModelSpec, mode: fastembed::QuantizationMode) -> Result<TextEmbedding> {
+    fn raw_embedding(
+        spec: &EmbeddingSpec,
+        mode: fastembed::QuantizationMode,
+    ) -> Result<TextEmbedding> {
         let dir = std::env::temp_dir().join("patterns_embed_hub_tests");
         std::fs::create_dir_all(&dir).context("test cache dir")?;
         let client = hub::HubFiles::new(dir, false)?;
-        let artifact = hub::fetch(&client, spec)?;
+        let artifact = hub::fetch(&client, spec.hub())?;
         let desc = graph_desc(&artifact.onnx)?;
         let selected = validate_graph(
             &desc,
@@ -1299,7 +1305,7 @@ mod tests {
         const REV: &str = "e58a8f756156a1293d763f17e3aae643474e9b8a";
 
         let dir = std::env::temp_dir().join("patterns_embed_hub_tests");
-        let base = ModelSpec::new(REPO, REV, "onnx/model_quantized.onnx", 768)
+        let base = EmbeddingSpec::new(REPO, REV, "onnx/model_quantized.onnx", 768)
             .expect("valid spec")
             .with_output("sentence_embedding")
             .with_quantization(Quantization::Dynamic);
@@ -1362,7 +1368,7 @@ mod tests {
             .get_or_init(|| async {
                 let dir = std::env::temp_dir().join("patterns_embed_tests");
                 std::fs::create_dir_all(&dir).expect("test cache dir");
-                let spec = ModelSpec::new(
+                let spec = EmbeddingSpec::new(
                     "Xenova/all-MiniLM-L6-v2",
                     "751bff37182d3f1213fa05d7196b954e230abad9",
                     "onnx/model_quantized.onnx",

@@ -35,7 +35,7 @@ pub enum Quantization {
     Dynamic,
 }
 
-/// MRL width to store; constructor-validated so [`ModelSpec`] always holds a valid one.
+/// MRL width to store; constructor-validated so [`EmbeddingSpec`] always holds a valid one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TruncatedDims(NonZeroUsize);
 
@@ -65,15 +65,11 @@ impl TruncatedDims {
 /// The only model interface: everything needed to fetch, verify and load one embedding artifact.
 ///
 /// Fields are private: invalid states (an unpinned revision, a zero width, an unaligned MRL width)
-/// are rejected by [`ModelSpec::new`] and the `with_*` builders.
+/// are rejected by [`EmbeddingSpec::new`] and the `with_*` builders.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModelSpec {
-    /// Hub repository, e.g. `mixedbread-ai/mxbai-embed-large-v1`.
-    repo: String,
-    /// Full commit sha — never a branch or tag, so the fetched bytes cannot change.
-    revision: String,
-    /// Artifact path within the repo, e.g. `onnx/model_quantized.onnx`.
-    file: String,
+pub struct EmbeddingSpec {
+    /// Pinned hub coordinates (repo/revision/file) - shared with the reranker fetch.
+    hub: HubSpec,
     /// Graph output to read. `None` requires the graph to have exactly one output.
     output: Option<&'static str>,
     /// How to reduce a 3-D output; `None` means the selected output is already pooled.
@@ -88,7 +84,7 @@ pub struct ModelSpec {
     prefixes: Prefixes,
 }
 
-impl ModelSpec {
+impl EmbeddingSpec {
     /// A spec for `repo`'s `file` at a pinned `revision`, whose native width is `dim`.
     ///
     /// # Errors
@@ -100,19 +96,10 @@ impl ModelSpec {
         file: impl Into<String>,
         dim: usize,
     ) -> Result<Self> {
-        let (repo, revision, file) = (repo.into(), revision.into(), file.into());
-        ensure!(!repo.trim().is_empty(), "repo must not be empty");
-        ensure!(!file.trim().is_empty(), "file must not be empty");
-        ensure!(
-            is_pinned_sha(&revision),
-            "revision `{revision}` is not a 40-character lowercase hex commit sha; pin a commit \
-             (branches, tags and short shas are not reproducible)"
-        );
+        let hub = HubSpec::new(repo, revision, file)?;
         let native_dim = NonZeroUsize::new(dim).ok_or_else(|| anyhow!("dim must be > 0"))?;
         Ok(Self {
-            repo,
-            revision,
-            file,
+            hub,
             output: None,
             pooling: None,
             quantization: Quantization::default(),
@@ -161,16 +148,8 @@ impl ModelSpec {
         self
     }
 
-    pub(super) fn repo(&self) -> &str {
-        &self.repo
-    }
-
-    pub(super) fn revision(&self) -> &str {
-        &self.revision
-    }
-
-    pub(super) fn file(&self) -> &str {
-        &self.file
+    pub(super) const fn hub(&self) -> &HubSpec {
+        &self.hub
     }
 
     pub(super) const fn output(&self) -> Option<&'static str> {
@@ -195,6 +174,53 @@ impl ModelSpec {
 
     pub(super) const fn prefixes(&self) -> &Prefixes {
         &self.prefixes
+    }
+}
+
+/// Pinned hub coordinates for one artifact: the shared fetch/verify input for
+/// both [`EmbeddingSpec`] (embedder) and [`crate::embed::Reranker`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubSpec {
+    repo: String,
+    revision: String,
+    file: String,
+}
+
+impl HubSpec {
+    /// Pinned coordinates for `repo`'s `file` at `revision`.
+    ///
+    /// # Errors
+    /// `repo`/`file` empty, or `revision` not a 40-hex commit sha.
+    pub fn new(
+        repo: impl Into<String>,
+        revision: impl Into<String>,
+        file: impl Into<String>,
+    ) -> Result<Self> {
+        let (repo, revision, file) = (repo.into(), revision.into(), file.into());
+        ensure!(!repo.trim().is_empty(), "repo must not be empty");
+        ensure!(!file.trim().is_empty(), "file must not be empty");
+        ensure!(
+            is_pinned_sha(&revision),
+            "revision `{revision}` is not a 40-character lowercase hex commit sha; pin a commit \
+             (branches, tags and short shas are not reproducible)"
+        );
+        Ok(Self {
+            repo,
+            revision,
+            file,
+        })
+    }
+
+    pub(super) fn repo(&self) -> &str {
+        &self.repo
+    }
+
+    pub(super) fn revision(&self) -> &str {
+        &self.revision
+    }
+
+    pub(super) fn file(&self) -> &str {
+        &self.file
     }
 }
 
@@ -231,8 +257,8 @@ mod tests {
 
     const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
-    fn spec() -> ModelSpec {
-        ModelSpec::new("org/repo", SHA, "onnx/model.onnx", 768).expect("valid spec")
+    fn spec() -> EmbeddingSpec {
+        EmbeddingSpec::new("org/repo", SHA, "onnx/model.onnx", 768).expect("valid spec")
     }
 
     #[test]
@@ -284,7 +310,7 @@ mod tests {
             "0123456789abcdef0123456789abcdef0123456z", // non-hex
         ] {
             assert!(
-                ModelSpec::new("org/repo", revision, "onnx/model.onnx", 768).is_err(),
+                EmbeddingSpec::new("org/repo", revision, "onnx/model.onnx", 768).is_err(),
                 "revision `{revision}` must be rejected"
             );
         }
@@ -298,7 +324,7 @@ mod tests {
             ("org/repo", "", 768),
             ("org/repo", "onnx/model.onnx", 0),
         ] {
-            ModelSpec::new(repo, SHA, file, dim)
+            EmbeddingSpec::new(repo, SHA, file, dim)
                 .expect_err("empty repo/file and dim 0 must be rejected");
         }
     }
@@ -306,9 +332,9 @@ mod tests {
     #[test]
     fn model_spec_defaults_and_builders() {
         let base = spec();
-        assert_eq!(base.repo(), "org/repo");
-        assert_eq!(base.revision(), SHA);
-        assert_eq!(base.file(), "onnx/model.onnx");
+        assert_eq!(base.hub().repo(), "org/repo");
+        assert_eq!(base.hub().revision(), SHA);
+        assert_eq!(base.hub().file(), "onnx/model.onnx");
         assert_eq!(base.native_dim(), 768);
         assert_eq!(base.output(), None);
         assert_eq!(base.pooling(), None);

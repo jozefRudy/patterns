@@ -33,7 +33,7 @@ pub fn parse_container(attr: &syn::Attribute) -> Result<Container> {
             Lit::Str(s) => s.clone(),
             other => return Err(Error::new(other.span(), "expected a string literal")),
         };
-        let Some(key) = nv.path.get_ident().map(|ident| ident.to_string()) else {
+        let Some(key) = nv.path.get_ident().map(ToString::to_string) else {
             return Err(Error::new(
                 nv.path.span(),
                 "unknown key; expected one of: `template`, `healthcheck`, `healthcheck_context`",

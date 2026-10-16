@@ -9,7 +9,7 @@ Modules (feature-gated; `default = ["llm_cli", "embed", "embed_api", "language",
 - `llm_cli` (feature `llm_cli`) — structured extraction from text via a local
   LLM CLI, with one-repair-retry semantics, via `SharedLlm`: a cloneable
   handle with a process-wide concurrency cap. The domain is one annotated
-  struct (`#[derive(Extractable)]` + `#[extract(template = "…", healthcheck = "…")]`);
+  struct (`#[derive(Extractable)]` + `#[extract(template = "…", healthcheck = "…", healthcheck_context = "…")]`);
   template files stay in consumers.
 - `embed` (feature `embed`) — text embeddings via fastembed (ONNX, CPU,
   in-process) for any pinned, content-verified `EmbeddingSpec`. Thread count at load;
@@ -315,8 +315,9 @@ let llm = SharedLlm::new(
 
 The consumer defines the domain in one annotated struct: `#[derive(JsonSchema)]`
 + `#[schemars(description)]` for the output shape and per-field guidance, plus
-`#[extract(template = "...", healthcheck = "...")]` for the prompt template and
-healthcheck fixture.
+`#[extract(template = "...", healthcheck = "...", healthcheck_context = "...")]`
+for the prompt template, the healthcheck fixture, and the context that fixture
+is rendered with.
 
 ```rust
 use patterns::Extractable;
@@ -325,6 +326,7 @@ use patterns::Extractable;
 #[extract(
     template = "prompts/job_ad.md",
     healthcheck = "prompts/job_ad_healthcheck.md",
+    healthcheck_context = "Backend roles at Acme; remote-friendly.",
 )]
 struct JobAd {
     #[schemars(description = "job title or role; if multiple listed, join them with ' + '")]
@@ -348,6 +350,9 @@ struct JobAd {
 - `#[extract(healthcheck = "...")]` — path to the markdown fixture, resolved
   by askama from the same configured dirs as `template` (no placeholders, so it
   renders to its literal content); generates `healthcheck_text`.
+- `#[extract(healthcheck_context = "...")]` — required context the fixture is
+  rendered with (mirrors the real call's `prompt_context`); generates
+  `healthcheck_context`. Use `""` when the questions do not use the context.
 
 `templates/prompts/job_ad.md`:
 
@@ -441,9 +446,11 @@ same role `#[derive(JsonSchema)]` + `#[schemars(description)]` play for
 `llm_cli`. Field attributes declare each question; `#[systemone(template =
 "...")]` binds the input template (askama, `{{ text }}` + `{{ prompt_context }}`
 only); the derive emits `questions()` + `render_state`, so the questions and
-the template cannot drift apart. `#[systemone(healthcheck = "...")]`
-(the required path to the fixture markdown) emits the batch-gate `Evaluatable`
-impl.
+the template cannot drift apart. `#[systemone(healthcheck = "...",
+healthcheck_context = "...")]` (both required) emits the batch-gate
+`Evaluatable` impl: the fixture markdown plus the context it is rendered with,
+so the healthcheck exercises every question (use `""` when no context is
+needed).
 
 ```rust
 use patterns::SystemOne;

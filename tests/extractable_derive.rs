@@ -7,7 +7,11 @@ use patterns::Extractable;
 use patterns::llm_cli::Extractable as _;
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema, Extractable)]
-#[extract(template = "test_fields.md", healthcheck = "test_healthcheck.md")]
+#[extract(
+    template = "test_fields.md",
+    healthcheck = "test_healthcheck.md",
+    healthcheck_context = "ctx"
+)]
 struct Test {
     value: String,
 }

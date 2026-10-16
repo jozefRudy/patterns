@@ -24,6 +24,10 @@ impl Extractable for Dummy {
         Ok("healthcheck".to_owned())
     }
 
+    fn healthcheck_context() -> String {
+        "ctx".to_owned()
+    }
+
     fn render_prompt(schema: &str, text: &str, _ctx: &str) -> anyhow::Result<String> {
         Ok(format!("{schema}\n{text}"))
     }

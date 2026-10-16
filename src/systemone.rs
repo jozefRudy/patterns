@@ -233,6 +233,9 @@ struct RawResponse {
 pub trait Evaluatable: Questions + for<'de> Deserialize<'de> {
     /// Fixture text rendered through the real template for the batch gate.
     fn healthcheck_text() -> Result<String>;
+    /// Context the healthcheck fixture is evaluated against; mirrors the real
+    /// call's `prompt_context` (e.g. a company/CV blurb).
+    fn healthcheck_context() -> String;
     /// Validate the parsed healthcheck answers.
     fn verify(&self) -> Result<()>;
 }
@@ -385,7 +388,7 @@ impl SharedSystemOne {
     /// auth/model/template/shape drift before a whole pass burns.
     pub async fn verify<E: Evaluatable>(&self) -> Result<()> {
         let text = E::healthcheck_text()?;
-        let state = E::render_state(&text, "healthcheck")?;
+        let state = E::render_state(&text, &E::healthcheck_context())?;
         self.evaluate_map::<E>(&serde_json::json!(state), &E::questions())
             .await?
             .verify()
@@ -553,7 +556,11 @@ mod tests {
     }
 
     #[derive(SystemOne, Debug, serde::Deserialize)]
-    #[systemone(template = "test_input.md", healthcheck = "test_healthcheck.md")]
+    #[systemone(
+        template = "test_input.md",
+        healthcheck = "test_healthcheck.md",
+        healthcheck_context = "ctx"
+    )]
     pub struct NoulOut {
         #[noul("Is it urgent?")]
         pub urgency: Noul,
@@ -571,7 +578,11 @@ mod tests {
     }
 
     #[derive(SystemOne, Debug, serde::Deserialize)]
-    #[systemone(template = "test_input.md", healthcheck = "test_healthcheck.md")]
+    #[systemone(
+        template = "test_input.md",
+        healthcheck = "test_healthcheck.md",
+        healthcheck_context = "ctx"
+    )]
     pub struct Mixed {
         #[noul("Urgent?")]
         is_urgent: Noul,

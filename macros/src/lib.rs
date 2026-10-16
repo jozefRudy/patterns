@@ -111,7 +111,7 @@ fn expand_extractable(input: &DeriveInput) -> Result<proc_macro2::TokenStream> {
         template,
         &["schema", "text", "prompt_context"],
     );
-    let methods = healthcheck_methods(&container.healthcheck);
+    let methods = healthcheck_methods(&container.healthcheck, &container.healthcheck_context);
 
     Ok(quote! {
         impl ::patterns::llm_cli::Extractable for #name {
@@ -397,7 +397,7 @@ fn expand(input: &DeriveInput) -> Result<proc_macro2::TokenStream> {
     );
 
     let healthcheck_impl = {
-        let methods = healthcheck_methods(&container.healthcheck);
+        let methods = healthcheck_methods(&container.healthcheck, &container.healthcheck_context);
         quote! {
             impl ::patterns::systemone::Evaluatable for #name {
                 #methods
@@ -488,7 +488,7 @@ mod tests {
     #[test]
     fn systemone_rejects_tuple_struct() {
         let input: DeriveInput = syn::parse_quote! {
-            #[systemone(template = "t.md", healthcheck = "hc.md")]
+            #[systemone(template = "t.md", healthcheck = "hc.md", healthcheck_context = "ctx")]
             struct Probe(Noul);
         };
         let err = expand(&input).expect_err("must fail");
@@ -498,7 +498,7 @@ mod tests {
     #[test]
     fn systemone_rejects_empty_struct() {
         let input: DeriveInput = syn::parse_quote! {
-            #[systemone(template = "t.md", healthcheck = "hc.md")]
+            #[systemone(template = "t.md", healthcheck = "hc.md", healthcheck_context = "ctx")]
             struct Probe {}
         };
         let err = expand(&input).expect_err("must fail");
@@ -517,7 +517,7 @@ mod tests {
     #[test]
     fn systemone_expands_valid() {
         let input: DeriveInput = syn::parse_quote! {
-            #[systemone(template = "t.md", healthcheck = "hc.md")]
+            #[systemone(template = "t.md", healthcheck = "hc.md", healthcheck_context = "ctx")]
             struct Probe { #[noul("q")] a: Noul }
         };
         let tokens = expand(&input).expect("expand").to_string();
@@ -538,7 +538,7 @@ mod tests {
     #[test]
     fn extractable_rejects_enum() {
         let input: DeriveInput = syn::parse_quote! {
-            #[extract(template = "t.md", healthcheck = "hc.md")]
+            #[extract(template = "t.md", healthcheck = "hc.md", healthcheck_context = "ctx")]
             enum Probe { A }
         };
         let err = expand_extractable(&input).expect_err("must fail");
@@ -548,7 +548,7 @@ mod tests {
     #[test]
     fn extractable_expands_valid() {
         let input: DeriveInput = syn::parse_quote! {
-            #[extract(template = "t.md", healthcheck = "hc.md")]
+            #[extract(template = "t.md", healthcheck = "hc.md", healthcheck_context = "ctx")]
             struct Probe { value: String }
         };
         let tokens = expand_extractable(&input).expect("expand").to_string();

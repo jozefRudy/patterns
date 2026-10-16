@@ -30,6 +30,10 @@ pub trait Extractable: JsonSchema + for<'de> Deserialize<'de> {
     /// Fixture text used to verify the LLM produces valid structured output.
     fn healthcheck_text() -> Result<String>;
 
+    /// Context the healthcheck fixture is rendered with; mirrors the real call's
+    /// `prompt_context` (e.g. a company/CV blurb).
+    fn healthcheck_context() -> String;
+
     /// Render the extraction prompt from the JSON schema, the (already
     /// truncated) input text, and optional dynamic prompt context.
     fn render_prompt(schema: &str, text: &str, prompt_context: &str) -> Result<String>;
@@ -264,7 +268,7 @@ impl SharedLlm {
     /// On any extraction or validation failure.
     pub async fn verify<T: Extractable + Send>(&self) -> Result<()> {
         let text = T::healthcheck_text()?;
-        self.extract::<T>(&text, "healthcheck".to_owned())
+        self.extract::<T>(&text, T::healthcheck_context())
             .await?
             .verify()
     }
@@ -325,6 +329,10 @@ struct Dummy {
 impl Extractable for Dummy {
     fn healthcheck_text() -> Result<String> {
         Ok("hello".to_owned())
+    }
+
+    fn healthcheck_context() -> String {
+        "ctx".to_owned()
     }
 
     fn render_prompt(_schema: &str, _text: &str, _ctx: &str) -> Result<String> {
@@ -473,6 +481,10 @@ if [ "$c" -eq 0 ]; then echo 'not json'; else echo '{"value":"fixed"}'; fi
     impl Extractable for Echo {
         fn healthcheck_text() -> Result<String> {
             Ok("hi".to_owned())
+        }
+
+        fn healthcheck_context() -> String {
+            "ctx".to_owned()
         }
 
         fn render_prompt(_schema: &str, text: &str, _ctx: &str) -> Result<String> {

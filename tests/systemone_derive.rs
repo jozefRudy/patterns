@@ -7,7 +7,11 @@ use patterns::SystemOne;
 use patterns::systemone::{Choice, Noul, Questions, Score};
 
 #[derive(SystemOne, Debug, serde::Deserialize)]
-#[systemone(template = "test_input.md", healthcheck = "test_healthcheck.md")]
+#[systemone(
+    template = "test_input.md",
+    healthcheck = "test_healthcheck.md",
+    healthcheck_context = "ctx"
+)]
 struct Test {
     #[noul("Is it urgent?")]
     urgent: Noul,

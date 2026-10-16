@@ -5,23 +5,25 @@ use quote::quote;
 use syn::spanned::Spanned;
 use syn::{Error, Expr, Ident, Lit, LitStr, Meta, Result, Token};
 
-/// Container args: `#[<derive>(template = "...", healthcheck = "...")]`.
+/// Container args: `#[<derive>(template = "...", healthcheck = "...", healthcheck_context = "...")]`.
 #[derive(Debug)]
 pub struct Container {
     pub template: LitStr,
     pub healthcheck: LitStr,
+    pub healthcheck_context: LitStr,
 }
 
 pub fn parse_container(attr: &syn::Attribute) -> Result<Container> {
     let mut template = None;
     let mut healthcheck = None;
+    let mut healthcheck_context = None;
     let metas =
         attr.parse_args_with(syn::punctuated::Punctuated::<Meta, Token![,]>::parse_terminated)?;
     for meta in metas {
         let Meta::NameValue(nv) = &meta else {
             return Err(Error::new(
                 meta.span(),
-                "expected `template = \"...\"` or `healthcheck = \"...\"`",
+                "expected one of: `template = \"...\"`, `healthcheck = \"...\"`, `healthcheck_context = \"...\"`",
             ));
         };
         let Expr::Lit(expr) = &nv.value else {
@@ -31,30 +33,38 @@ pub fn parse_container(attr: &syn::Attribute) -> Result<Container> {
             Lit::Str(s) => s.clone(),
             other => return Err(Error::new(other.span(), "expected a string literal")),
         };
-        if nv.path.is_ident("template") {
-            if template.is_some() {
-                return Err(Error::new(nv.path.span(), "duplicate `template`"));
-            }
-            template = Some(value);
-        } else if nv.path.is_ident("healthcheck") {
-            if healthcheck.is_some() {
-                return Err(Error::new(nv.path.span(), "duplicate `healthcheck`"));
-            }
-            healthcheck = Some(value);
-        } else {
+        let Some(key) = nv.path.get_ident().map(|ident| ident.to_string()) else {
             return Err(Error::new(
                 nv.path.span(),
-                "unknown key; expected `template` or `healthcheck`",
+                "unknown key; expected one of: `template`, `healthcheck`, `healthcheck_context`",
             ));
+        };
+        let slot = match key.as_str() {
+            "template" => &mut template,
+            "healthcheck" => &mut healthcheck,
+            "healthcheck_context" => &mut healthcheck_context,
+            _ => {
+                return Err(Error::new(
+                    nv.path.span(),
+                    "unknown key; expected one of: `template`, `healthcheck`, `healthcheck_context`",
+                ))
+            }
+        };
+        if slot.is_some() {
+            return Err(Error::new(nv.path.span(), format!("duplicate `{key}`")));
         }
+        *slot = Some(value);
     }
     let template =
         template.ok_or_else(|| Error::new(attr.span(), "missing `template = \"...\"`"))?;
     let healthcheck =
         healthcheck.ok_or_else(|| Error::new(attr.span(), "missing `healthcheck = \"...\"`"))?;
+    let healthcheck_context = healthcheck_context
+        .ok_or_else(|| Error::new(attr.span(), "missing `healthcheck_context = \"...\"`"))?;
     Ok(Container {
         template,
         healthcheck,
+        healthcheck_context,
     })
 }
 
@@ -83,9 +93,10 @@ pub fn render_fn(fn_name: &Ident, template: &LitStr, params: &[&str]) -> TokenSt
 }
 
 /// Emit `healthcheck_text` (renders the fixture through askama, so its path
-/// resolves from the same configured dirs as `template`) + `verify` forwarding
+/// resolves from the same configured dirs as `template`), `healthcheck_context`
+/// (the context the healthcheck is evaluated against) + `verify` forwarding
 /// used by both `Evaluatable` and `Extractable` healthcheck impls.
-pub fn healthcheck_methods(healthcheck: &LitStr) -> TokenStream {
+pub fn healthcheck_methods(healthcheck: &LitStr, healthcheck_context: &LitStr) -> TokenStream {
     quote! {
         fn healthcheck_text() -> ::anyhow::Result<::std::string::String> {
             #[derive(::patterns::askama::Template)]
@@ -96,6 +107,10 @@ pub fn healthcheck_methods(healthcheck: &LitStr) -> TokenStream {
             Healthcheck
                 .render()
                 .map_err(::core::convert::Into::into)
+        }
+
+        fn healthcheck_context() -> ::std::string::String {
+            #healthcheck_context.to_owned()
         }
 
         fn verify(&self) -> ::anyhow::Result<()> {
@@ -120,43 +135,66 @@ mod tests {
 
     #[test]
     fn parses_template_and_healthcheck() {
-        let attr = attr(quote! { #[systemone(template = "t.md", healthcheck = "hc.md")] });
+        let attr = attr(quote! {
+            #[systemone(template = "t.md", healthcheck = "hc.md", healthcheck_context = "ctx")]
+        });
         let container = parse_container(&attr).expect("valid");
         assert_eq!(container.template.value(), "t.md");
         assert_eq!(container.healthcheck.value(), "hc.md");
+        assert_eq!(container.healthcheck_context.value(), "ctx");
     }
 
     #[test]
     fn rejects_missing_healthcheck() {
-        let attr = attr(quote! { #[systemone(template = "t.md")] });
+        let attr = attr(quote! {
+            #[systemone(template = "t.md", healthcheck_context = "ctx")]
+        });
         let err = parse_container(&attr).expect_err("must fail");
         assert!(err.to_string().contains("missing `healthcheck"), "{err}");
     }
 
     #[test]
+    fn rejects_missing_healthcheck_context() {
+        let attr = attr(quote! { #[systemone(template = "t.md", healthcheck = "hc.md")] });
+        let err = parse_container(&attr).expect_err("must fail");
+        assert!(
+            err.to_string().contains("missing `healthcheck_context"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn rejects_missing_template() {
-        let attr = attr(quote! { #[systemone(healthcheck = "hc.md")] });
+        let attr = attr(quote! {
+            #[systemone(healthcheck = "hc.md", healthcheck_context = "ctx")]
+        });
         let err = parse_container(&attr).expect_err("must fail");
         assert!(err.to_string().contains("missing `template"), "{err}");
     }
 
     #[test]
     fn rejects_unknown_key() {
-        let attr = attr(quote! { #[systemone(template = "t.md", boom = "x")] });
+        let attr = attr(quote! {
+            #[systemone(template = "t.md", healthcheck = "hc.md", healthcheck_context = "ctx", boom = "x")]
+        });
         let err = parse_container(&attr).expect_err("must fail");
         assert!(err.to_string().contains("unknown key"), "{err}");
     }
 
     #[test]
     fn rejects_duplicate_key() {
-        let attr = attr(quote! { #[systemone(template = "a", template = "b")] });
+        let attr = attr(quote! {
+            #[systemone(template = "a", template = "b", healthcheck = "hc.md", healthcheck_context = "ctx")]
+        });
         let err = parse_container(&attr).expect_err("must fail");
         assert!(err.to_string().contains("duplicate `template`"), "{err}");
     }
 
     #[test]
     fn rejects_non_string_value() {
-        let attr = attr(quote! { #[systemone(template = 3)] });
+        let attr = attr(quote! {
+            #[systemone(template = 3, healthcheck = "hc.md", healthcheck_context = "ctx")]
+        });
         let err = parse_container(&attr).expect_err("must fail");
         assert!(err.to_string().contains("string literal"), "{err}");
     }
@@ -164,8 +202,10 @@ mod tests {
     #[test]
     fn healthcheck_methods_emit_render_and_verify() {
         let healthcheck: LitStr = syn::parse_quote!("hc.md");
-        let tokens = healthcheck_methods(&healthcheck).to_string();
+        let context: LitStr = syn::parse_quote!("ctx");
+        let tokens = healthcheck_methods(&healthcheck, &context).to_string();
         assert!(tokens.contains("healthcheck_text"));
+        assert!(tokens.contains("healthcheck_context"));
         assert!(tokens.contains("askama"));
         assert!(tokens.contains("fn verify"));
     }

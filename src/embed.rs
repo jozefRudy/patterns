@@ -18,26 +18,71 @@
 //! is, since that re-export is what keeps a single ONNX Runtime linkage in the graph.
 
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use fastembed::{InitOptionsUserDefined, OutputKey, TextEmbedding, UserDefinedEmbeddingModel};
+use ort::ortsys;
 use ort::session::builder::GraphOptimizationLevel;
 
-/// ORT CPU execution provider with the arena on or off. The arena keeps its high-water mark
-/// for the session's whole life, so it trades memory for throughput.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CpuArena {
-    On,
-    Off,
+/// `kSameAsRequested`: extend the arena by exactly what was asked for. The default
+/// (`kNextPowerOfTwo`) doubles each extension and keeps the overshoot for the session's life.
+const ARENA_EXTEND_SAME_AS_REQUESTED: std::ffi::c_int = 1;
+
+/// ORT's C API exports no symbol for this, so it lives here; matches `ep::CPU::name()`.
+const CPU_PROVIDER: &std::ffi::CStr = c"CPUExecutionProvider";
+
+/// Cap the ORT CPU arena by registering an arena config on the shared environment
+/// (`max_mem == 0` leaves stock ORT alone: no config, power-of-two growth, uncapped).
+///
+/// The registration is process-global because ORT refuses a second allocator for the
+/// same memory info, so the first non-zero call decides the cap for every session.
+pub fn set_cpu_arena_max_mem(max_mem: usize) -> Result<()> {
+    static REGISTERED: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+    if max_mem == 0 {
+        return Ok(());
+    }
+    match REGISTERED.get_or_init(|| register_cpu_arena(max_mem).map_err(|err| err.to_string())) {
+        Ok(()) => Ok(()),
+        Err(err) => bail!("register the CPU arena: {err}"),
+    }
 }
 
-pub(crate) fn cpu_execution_provider(
-    arena: CpuArena,
-) -> ort::execution_providers::ExecutionProviderDispatch {
-    ort::ep::CPU::default()
-        .with_arena_allocator(arena == CpuArena::On)
-        .build()
+fn register_cpu_arena(max_mem: usize) -> std::result::Result<(), ort::Error> {
+    use ort::AsPointer as _;
+
+    let mut cfg: *mut ort::sys::OrtArenaCfg = std::ptr::null_mut();
+    ortsys![unsafe CreateArenaCfg(max_mem, ARENA_EXTEND_SAME_AS_REQUESTED, 0, 0, &raw mut cfg)?];
+    let mem_info = ort::memory::MemoryInfo::new(
+        ort::memory::AllocationDevice::CPU,
+        0,
+        ort::memory::AllocatorType::Arena,
+        ort::memory::MemoryType::Default,
+    )?;
+    let env = ort::environment::Environment::current()?;
+    ortsys![unsafe CreateAndRegisterAllocatorV2(
+        env.ptr().cast_mut(),
+        CPU_PROVIDER.as_ptr(),
+        mem_info.ptr(),
+        cfg,
+        std::ptr::null(),
+        std::ptr::null(),
+        0
+    )?];
+    // ORT copies the values into the registered allocator, so the config object is ours to free
+    ortsys![unsafe ReleaseArenaCfg(cfg)];
+    Ok(())
+}
+
+/// The CPU execution provider with the memory arena on. Buffers are cached and reused
+/// instead of going back to the allocator every run, which is where the throughput is.
+pub(crate) fn cpu_execution_provider() -> ort::execution_providers::ExecutionProviderDispatch {
+    ort::ep::CPU::default().with_arena_allocator(true).build()
+}
+
+/// Route the session's allocations through the env-registered (capped) arena.
+pub(crate) fn use_env_allocators(config: &mut Vec<(String, String)>) {
+    config.push(("session.use_env_allocators".to_string(), "1".to_string()));
 }
 
 pub use crate::chunk::{ChunkOptions, EmbeddedChunk, TextChunk};
@@ -83,21 +128,21 @@ pub struct LoadOptions<S> {
     pub intra_threads: Option<usize>,
     /// Show model download progress bar on first fetch.
     pub show_download_progress: bool,
-    /// ORT CPU arena caches buffers for the session's whole life, so RSS only climbs (its
-    /// high-water mark survives every run). `false` = malloc/free per tensor, so RSS follows
-    /// the current batch instead. `true` = ORT default: faster, unbounded growth.
-    pub cpu_arena: bool,
+    /// ORT CPU arena cap in bytes. The arena caches buffers for the session's whole life
+    /// and only ever grows, so its high-water mark is the RSS floor. `0` = stock ORT (no
+    /// cap, power-of-two growth); `> 0` = capped, exact-size growth.
+    pub cpu_arena_max_mem: usize,
 }
 
 impl<S> LoadOptions<S> {
-    /// Defaults: all cores, download progress shown, ORT CPU arena on.
+    /// Defaults: all cores, download progress shown, stock ORT arena (uncapped).
     #[must_use]
     pub const fn new(spec: S) -> Self {
         Self {
             spec,
             intra_threads: None,
             show_download_progress: true,
-            cpu_arena: true,
+            cpu_arena_max_mem: 0,
         }
     }
 
@@ -108,10 +153,11 @@ impl<S> LoadOptions<S> {
         self
     }
 
-    /// Enable or disable the ORT CPU arena (see [`LoadOptions::cpu_arena`]).
+    /// Cap the ORT CPU arena at `max_mem` bytes (see [`LoadOptions::cpu_arena_max_mem`]).
+    /// The cap is process-global: the first non-zero call decides it for every session.
     #[must_use]
-    pub const fn with_cpu_arena(mut self, enable: bool) -> Self {
-        self.cpu_arena = enable;
+    pub const fn with_cpu_arena_max_mem(mut self, max_mem: usize) -> Self {
+        self.cpu_arena_max_mem = max_mem;
         self
     }
 
@@ -177,7 +223,7 @@ impl Embedder {
             spec,
             intra_threads,
             show_download_progress,
-            cpu_arena,
+            cpu_arena_max_mem,
         } = options;
         // prefixes are model configuration, so they live on the spec
         let prefixes = spec.prefixes().clone();
@@ -189,7 +235,7 @@ impl Embedder {
                 &cache_dir,
                 intra_threads,
                 show_download_progress,
-                cpu_arena,
+                cpu_arena_max_mem,
             )
         })
         .await
@@ -492,7 +538,7 @@ fn load_blocking(
     cache_dir: &Path,
     intra_threads: Option<usize>,
     show_download_progress: bool,
-    cpu_arena: bool,
+    cpu_arena_max_mem: usize,
 ) -> Result<Loaded> {
     std::fs::create_dir_all(cache_dir).context("create the model cache dir")?;
     let client = hub::HubFiles::new(cache_dir.to_path_buf(), show_download_progress)?;
@@ -513,11 +559,7 @@ fn load_blocking(
         &selected,
         spec.quantization().into(),
         intra_threads,
-        if cpu_arena {
-            CpuArena::On
-        } else {
-            CpuArena::Off
-        },
+        cpu_arena_max_mem,
     )?;
     let identity = ModelIdentity::new(spec, content_hash, selected.mrl_from_metadata);
 
@@ -581,7 +623,7 @@ fn build_text_embedding(
     selected: &SelectedOutput,
     mode: fastembed::QuantizationMode,
     intra_threads: Option<usize>,
-    cpu_arena: CpuArena,
+    cpu_arena_max_mem: usize,
 ) -> Result<TextEmbedding> {
     let mut model = UserDefinedEmbeddingModel::new(artifact.onnx, artifact.tokenizer_files)
         .with_quantization(mode);
@@ -597,8 +639,12 @@ fn build_text_embedding(
     }));
 
     let mut options = InitOptionsUserDefined::new()
-        .with_execution_providers(vec![cpu_execution_provider(cpu_arena)])
+        .with_execution_providers(vec![cpu_execution_provider()])
         .with_max_length(artifact.max_length);
+    if cpu_arena_max_mem > 0 {
+        set_cpu_arena_max_mem(cpu_arena_max_mem)?;
+        use_env_allocators(&mut options.session_config);
+    }
     if let Some(threads) = intra_threads {
         options = options.with_intra_threads(threads);
     }
@@ -1285,7 +1331,7 @@ mod tests {
             artifact.pooling_meta.as_ref(),
             artifact.matryoshka_dims.as_deref(),
         )?;
-        build_text_embedding(artifact, spec, &selected, mode, None, CpuArena::On)
+        build_text_embedding(artifact, spec, &selected, mode, None, 0)
     }
 
     /// Run the probe on a raw handle.

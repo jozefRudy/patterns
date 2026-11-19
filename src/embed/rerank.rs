@@ -50,7 +50,7 @@ impl Reranker {
             spec,
             intra_threads,
             show_download_progress,
-            cpu_arena,
+            cpu_arena_max_mem,
         } = options;
         let cache_dir = cache_dir.to_path_buf();
         let reranker = tokio::task::spawn_blocking(move || -> Result<TextRerank> {
@@ -59,14 +59,13 @@ impl Reranker {
             let artifact = hub::fetch(&client, &spec)?;
             let model = UserDefinedRerankingModel::new(artifact.onnx, artifact.tokenizer_files);
 
-            let cpu_arena = if cpu_arena {
-                super::CpuArena::On
-            } else {
-                super::CpuArena::Off
-            };
             let mut init = RerankInitOptionsUserDefined::new()
-                .with_execution_providers(vec![super::cpu_execution_provider(cpu_arena)])
+                .with_execution_providers(vec![super::cpu_execution_provider()])
                 .with_max_length(artifact.max_length);
+            if cpu_arena_max_mem > 0 {
+                super::set_cpu_arena_max_mem(cpu_arena_max_mem)?;
+                super::use_env_allocators(&mut init.session_config);
+            }
             if let Some(threads) = intra_threads {
                 init = init.with_intra_threads(threads);
             }

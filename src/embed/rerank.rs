@@ -59,7 +59,11 @@ impl Reranker {
             let artifact = hub::fetch(&client, &spec)?;
             let model = UserDefinedRerankingModel::new(artifact.onnx, artifact.tokenizer_files);
 
-            let cpu_arena = if cpu_arena { super::CpuArena::On } else { super::CpuArena::Off };
+            let cpu_arena = if cpu_arena {
+                super::CpuArena::On
+            } else {
+                super::CpuArena::Off
+            };
             let mut init = RerankInitOptionsUserDefined::new()
                 .with_execution_providers(vec![super::cpu_execution_provider(cpu_arena)])
                 .with_max_length(artifact.max_length);

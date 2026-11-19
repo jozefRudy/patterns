@@ -47,7 +47,7 @@ pub fn parse_container(attr: &syn::Attribute) -> Result<Container> {
                 return Err(Error::new(
                     nv.path.span(),
                     "unknown key; expected one of: `template`, `healthcheck`, `healthcheck_context`",
-                ))
+                ));
             }
         };
         if slot.is_some() {

@@ -24,6 +24,22 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use fastembed::{InitOptionsUserDefined, OutputKey, TextEmbedding, UserDefinedEmbeddingModel};
 use ort::session::builder::GraphOptimizationLevel;
 
+/// ORT CPU execution provider with the arena on or off. The arena keeps its high-water mark
+/// for the session's whole life, so it trades memory for throughput.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CpuArena {
+    On,
+    Off,
+}
+
+pub(crate) fn cpu_execution_provider(
+    arena: CpuArena,
+) -> ort::execution_providers::ExecutionProviderDispatch {
+    ort::ep::CPU::default()
+        .with_arena_allocator(arena == CpuArena::On)
+        .build()
+}
+
 pub use crate::chunk::{ChunkOptions, EmbeddedChunk, TextChunk};
 use crate::chunk::{SPECIAL_TOKEN_HEADROOM, TokenSpan, chunk_spans, fake_token_spans};
 pub use crate::prefixes::Prefixes;
@@ -67,16 +83,21 @@ pub struct LoadOptions<S> {
     pub intra_threads: Option<usize>,
     /// Show model download progress bar on first fetch.
     pub show_download_progress: bool,
+    /// ORT CPU arena caches buffers for the session's whole life, so RSS only climbs (its
+    /// high-water mark survives every run). `false` = malloc/free per tensor, so RSS follows
+    /// the current batch instead. `true` = ORT default: faster, unbounded growth.
+    pub cpu_arena: bool,
 }
 
 impl<S> LoadOptions<S> {
-    /// Defaults: all cores, download progress shown.
+    /// Defaults: all cores, download progress shown, ORT CPU arena on.
     #[must_use]
     pub const fn new(spec: S) -> Self {
         Self {
             spec,
             intra_threads: None,
             show_download_progress: true,
+            cpu_arena: true,
         }
     }
 
@@ -84,6 +105,13 @@ impl<S> LoadOptions<S> {
     #[must_use]
     pub const fn with_intra_threads(mut self, threads: usize) -> Self {
         self.intra_threads = Some(threads);
+        self
+    }
+
+    /// Enable or disable the ORT CPU arena (see [`LoadOptions::cpu_arena`]).
+    #[must_use]
+    pub const fn with_cpu_arena(mut self, enable: bool) -> Self {
+        self.cpu_arena = enable;
         self
     }
 
@@ -149,13 +177,20 @@ impl Embedder {
             spec,
             intra_threads,
             show_download_progress,
+            cpu_arena,
         } = options;
         // prefixes are model configuration, so they live on the spec
         let prefixes = spec.prefixes().clone();
         let cache_dir = cache_dir.to_path_buf();
 
         let loaded = tokio::task::spawn_blocking(move || {
-            load_blocking(&spec, &cache_dir, intra_threads, show_download_progress)
+            load_blocking(
+                &spec,
+                &cache_dir,
+                intra_threads,
+                show_download_progress,
+                cpu_arena,
+            )
         })
         .await
         .context("the model load task failed")??;
@@ -457,6 +492,7 @@ fn load_blocking(
     cache_dir: &Path,
     intra_threads: Option<usize>,
     show_download_progress: bool,
+    cpu_arena: bool,
 ) -> Result<Loaded> {
     std::fs::create_dir_all(cache_dir).context("create the model cache dir")?;
     let client = hub::HubFiles::new(cache_dir.to_path_buf(), show_download_progress)?;
@@ -477,6 +513,11 @@ fn load_blocking(
         &selected,
         spec.quantization().into(),
         intra_threads,
+        if cpu_arena {
+            CpuArena::On
+        } else {
+            CpuArena::Off
+        },
     )?;
     let identity = ModelIdentity::new(spec, content_hash, selected.mrl_from_metadata);
 
@@ -540,6 +581,7 @@ fn build_text_embedding(
     selected: &SelectedOutput,
     mode: fastembed::QuantizationMode,
     intra_threads: Option<usize>,
+    cpu_arena: CpuArena,
 ) -> Result<TextEmbedding> {
     let mut model = UserDefinedEmbeddingModel::new(artifact.onnx, artifact.tokenizer_files)
         .with_quantization(mode);
@@ -554,7 +596,9 @@ fn build_text_embedding(
         None => Box::leak(selected.name.clone().into_boxed_str()),
     }));
 
-    let mut options = InitOptionsUserDefined::new().with_max_length(artifact.max_length);
+    let mut options = InitOptionsUserDefined::new()
+        .with_execution_providers(vec![cpu_execution_provider(cpu_arena)])
+        .with_max_length(artifact.max_length);
     if let Some(threads) = intra_threads {
         options = options.with_intra_threads(threads);
     }
@@ -1241,7 +1285,7 @@ mod tests {
             artifact.pooling_meta.as_ref(),
             artifact.matryoshka_dims.as_deref(),
         )?;
-        build_text_embedding(artifact, spec, &selected, mode, None)
+        build_text_embedding(artifact, spec, &selected, mode, None, CpuArena::On)
     }
 
     /// Run the probe on a raw handle.

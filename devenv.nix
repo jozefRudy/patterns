@@ -9,8 +9,9 @@
 
   languages = {
     rust = {
+      channel = "stable";
+      version = "1.100.0";
       enable = true;
-      channel = "nightly";
       components = ["rustc" "cargo" "clippy" "rustfmt" "rust-analyzer" "rust-src"];
     };
   };

@@ -254,3 +254,20 @@ fn hex(bytes: &[u8]) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_size_does_not_change_the_identity() {
+        // The chunk cap is a memory knob: reshaping the run must not reset the stored corpus.
+        let base = EmbeddingSpec::new("acme/model", "0".repeat(40), "onnx/model.onnx", 384)
+            .expect("valid spec");
+        let capped = base.clone().with_batch_size(64);
+        let hash = "ab".repeat(32);
+        let a = ModelIdentity::new(&base, hash.clone(), false);
+        let b = ModelIdentity::new(&capped, hash, false);
+        assert_eq!(a.id(), b.id());
+    }
+}

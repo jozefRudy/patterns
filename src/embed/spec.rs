@@ -82,6 +82,10 @@ pub struct EmbeddingSpec {
     truncate_to: Option<TruncatedDims>,
     /// Query/document prefixes the model was trained with (empty for symmetric models).
     prefixes: Prefixes,
+    /// Chunks per ONNX run; `None` = fastembed's 256 ceiling. Memory-only, and deliberately not
+    /// part of [`crate::embed::ModelIdentity::id`] (see `spec_digest`), so changing it never
+    /// invalidates stored vectors.
+    batch_size: Option<usize>,
 }
 
 impl EmbeddingSpec {
@@ -106,6 +110,7 @@ impl EmbeddingSpec {
             native_dim,
             truncate_to: None,
             prefixes: Prefixes::none(),
+            batch_size: None,
         })
     }
 
@@ -148,6 +153,15 @@ impl EmbeddingSpec {
         self
     }
 
+    /// Cap chunks per ONNX inference. Memory-only: the ORT arena caches one buffer set per
+    /// `(batch, seq)` shape and only ever grows, so this is the knob that bounds it. Rejected at
+    /// load for [`Quantization::Dynamic`] specs (fastembed cannot split a dynamic-quantized call).
+    #[must_use]
+    pub const fn with_batch_size(mut self, batch_size: usize) -> Self {
+        self.batch_size = Some(batch_size);
+        self
+    }
+
     pub(super) const fn hub(&self) -> &HubSpec {
         &self.hub
     }
@@ -174,6 +188,10 @@ impl EmbeddingSpec {
 
     pub(super) const fn prefixes(&self) -> &Prefixes {
         &self.prefixes
+    }
+
+    pub(super) const fn batch_size(&self) -> Option<usize> {
+        self.batch_size
     }
 }
 

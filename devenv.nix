@@ -9,7 +9,7 @@
 
   languages = {
     rust = {
-      version = "1.100.0";
+      channel = "stable";
       enable = true;
       components = ["rustc" "cargo" "clippy" "rustfmt" "rust-analyzer" "rust-src"];
     };

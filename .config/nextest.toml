@@ -1,0 +1,12 @@
+# Ignored embed tests share one on-disk hub cache (patterns_embed_hub_tests) and
+# hf-hub takes a per-blob lock while downloading, so a parallel first run fails.
+# Warm both specs sequentially before the suite touches them.
+experimental = ["setup-scripts"]
+
+[scripts.setup.warm-embed-models]
+command = 'cargo test -p patterns --features embed --lib -- --ignored --test-threads 1 embed::tests::probe'
+slow-timeout = { period = "300s", terminate-after = 2 }
+
+[[profile.default.scripts]]
+filter = 'test(embed::tests::)'
+setup = 'warm-embed-models'

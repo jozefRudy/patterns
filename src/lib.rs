@@ -17,8 +17,8 @@ pub mod embed_api;
 #[cfg(feature = "language")]
 pub mod language;
 pub mod limits;
-#[cfg(feature = "llm_cli")]
-pub mod llm_cli;
+#[cfg(feature = "llm")]
+pub mod llm;
 pub mod prefixes;
 pub mod retry;
 #[cfg(feature = "systemone")]
@@ -49,8 +49,8 @@ const _: () = assert!(
 #[cfg(feature = "templating")]
 pub use askama;
 
-/// `#[extract(..)]`-annotated extraction structs (see `llm_cli`).
-#[cfg(feature = "llm_cli")]
+/// `#[extract(..)]`-annotated extraction structs (see `llm`).
+#[cfg(feature = "llm")]
 pub use patterns_macros::Extractable;
 
 /// `#[derive(SystemOne)]` for annotated question structs (see `systemone`).

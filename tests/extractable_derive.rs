@@ -4,7 +4,7 @@
 //! `healthcheck_text`.
 
 use patterns::Extractable;
-use patterns::llm_cli::Extractable as _;
+use patterns::llm::Extractable as _;
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema, Extractable)]
 #[extract(

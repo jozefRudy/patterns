@@ -1,7 +1,7 @@
 //! Generic `TypeSafe` `SystemOne` (Jev) client.
 //!
 //! One bounded HTTP client for the `SystemOne` protocol (`POST {base_url}/v1/systemone`),
-//! sibling to `llm_cli`/`embed`. Backends differ only by `base_url` (direct
+//! sibling to `llm`/`embed`. Backends differ only by `base_url` (direct
 //! `https://api.typesafe.ai` vs `OpenRouter` `https://openrouter.ai/api`); the path is
 //! fixed internally. The caller supplies base URL, API key and model — the client
 //! never reads the environment.
@@ -227,7 +227,7 @@ struct RawResponse {
 
 /// A domain whose healthcheck the client can verify end-to-end.
 ///
-/// Mirrors [`crate::llm_cli::Extractable`]: the domain owns the probe fixture
+/// Mirrors [`crate::llm::Extractable`]: the domain owns the probe fixture
 /// and the validation of the parsed answers. Define one impl per evaluation
 /// shape and call [`SharedSystemOne::verify`] before a batch.
 pub trait Evaluatable: Questions + for<'de> Deserialize<'de> {
@@ -322,8 +322,8 @@ impl SharedSystemOne {
     ///
     /// `state` is anything serializable: a rendered input string, a typed
     /// struct, or a `json!({...})` object. One bounded request, retried per the
-    /// configured [`RetryPolicy`] (429/5xx/timeouts/transport) under the
-    /// process-wide concurrency cap. On parse failure the raw
+    /// configured [`RetryPolicy`] (429/5xx/timeouts/transport) under this
+    /// handle's concurrency cap. On parse failure the raw
     /// `answers` JSON is included in the error context.
     pub async fn evaluate<Q: Questions>(&self, state: impl Serialize) -> Result<Q::Answers> {
         let state = serde_json::to_value(state).context("serialize systemone state")?;
@@ -380,7 +380,7 @@ impl SharedSystemOne {
             .with_context(|| format!("parse systemone answers: {answers}"))
     }
 
-    /// Domain-aware healthcheck, mirroring [`crate::llm_cli::SharedLlm::verify`].
+    /// Domain-aware healthcheck, mirroring [`crate::llm::ChatLlm::verify`].
     ///
     /// Renders `E::healthcheck_text` through `E`'s real template, evaluates
     /// `E`'s real questions, and validates the result via [`Evaluatable::verify`].
@@ -1001,8 +1001,10 @@ mod tests {
                 .expect("evaluate");
             let (wire_score, expected) =
                 wire_score_vs_expected(answers.get("rating").expect("rating"));
+            // The service computes `score` from unrounded probabilities; ours re-derives it
+            // from the payload, so the two differ by up to a rounding step (~0.01 per level).
             assert!(
-                (wire_score - f64::from(expected)).abs() < 0.01,
+                (wire_score - f64::from(expected)).abs() < 0.02,
                 "wire score {wire_score} != expected {expected} for {text:?}"
             );
         }

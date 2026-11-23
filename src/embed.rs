@@ -1353,21 +1353,30 @@ mod tests {
     async fn capped_batch_size_matches_uncapped_vectors() {
         // The chunk cap is a memory knob only: slicing a non-dynamic run must not move the
         // vectors, or every cap change would silently invalidate the index.
+        // Batch shape retiles the ONNX kernels, so equality is up to f32 noise (~1e-8), not
+        // bit-exact. Anything above this means the cap changed the embedding, not just rounding.
+        const TOL: f32 = 1e-6;
+        // One session: two sessions differ at f32 last bits from thread partitioning alone,
+        // which would hide whether the cap itself moves the vectors.
         let spec = minilm_fp32_spec();
-        let mut capped = raw_embedding(&spec, fastembed::QuantizationMode::None).expect("capped");
-        let mut free = raw_embedding(&spec, fastembed::QuantizationMode::None).expect("uncapped");
+        let mut te = raw_embedding(&spec, fastembed::QuantizationMode::None).expect("model");
         let texts = [
             "rust ownership and lifetimes",
             "a recipe for chocolate cake",
             "binarization keeps the sign of each dimension",
         ];
-        let a = capped.embed(texts, Some(2)).expect("capped embed");
-        let b = free.embed(texts, None).expect("uncapped embed");
-        for (capped_row, free_row) in a.iter().zip(&b) {
-            assert_eq!(
-                capped_row, free_row,
-                "capped run must match the uncapped run"
-            );
+        let capped = te.embed(texts, Some(2)).expect("capped embed");
+        let free = te.embed(texts, None).expect("uncapped embed");
+        assert_eq!(capped.len(), free.len(), "cap changed the row count");
+        for (capped_row, free_row) in capped.iter().zip(&free) {
+            assert_eq!(capped_row.len(), free_row.len(), "cap changed the dims");
+            for (x, y) in capped_row.iter().zip(free_row) {
+                let moved = (x - y).abs();
+                assert!(
+                    moved <= TOL,
+                    "cap moved a component by {moved:e} (limit {TOL:e})"
+                );
+            }
         }
     }
 

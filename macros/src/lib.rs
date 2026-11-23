@@ -2,7 +2,7 @@
 //! `patterns::systemone`.
 //!
 //! The consumer struct is the source of truth (mirroring
-//! `#[derive(JsonSchema)]` + `#[schemars(description)]` in `llm_cli`): field
+//! `#[derive(JsonSchema)]` + `#[schemars(description)]` in `llm`): field
 //! attributes declare each question, container attributes bind the state
 //! template and the healthcheck fixture. The derive emits the askama input
 //! template struct, `impl Questions` (`questions()` + `render_state`), and
@@ -64,7 +64,7 @@ pub fn derive_systemone(input: TokenStream) -> TokenStream {
 //   #[template(path = <template>, ext = "md", askama = ::patterns::askama)]
 //   struct <Name>Prompt<'a> { schema: &'a str, text: &'a str, prompt_context: &'a str }
 //
-//   impl ::patterns::llm_cli::Extractable for <Name> {
+//   impl ::patterns::llm::Extractable for <Name> {
 //       fn healthcheck_text() -> anyhow::Result<String>
 //       fn render_prompt(schema, text, prompt_context) -> anyhow::Result<String>
 //       fn verify(&self) -> anyhow::Result<()> { Self::verify(self) }  // inherent
@@ -114,7 +114,7 @@ fn expand_extractable(input: &DeriveInput) -> Result<proc_macro2::TokenStream> {
     let methods = healthcheck_methods(&container.healthcheck, &container.healthcheck_context);
 
     Ok(quote! {
-        impl ::patterns::llm_cli::Extractable for #name {
+        impl ::patterns::llm::Extractable for #name {
             #methods
 
             #render_prompt

@@ -15,7 +15,7 @@ patterns-macros = { path = "macros", optional = true }
 schemars = { version = "1", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["process", "sync", "time"] }
+tokio = { version = "1", features = ["sync", "time"] }
 fastembed = { version = "=6.1.0", default-features = false, features = ["ort-download-binaries-native-tls", "hf-hub-native-tls"], optional = true }
 lingua = { version = "1.8.0", default-features = false, features = ["english", "french", "german", "spanish", "polish"], optional = true }
 # count-only tokenizer access (lock-free) — version pinned to fastembed's
@@ -26,10 +26,10 @@ sha1 = { version = "0.11", optional = true }
 ort = { version = "=2.0.0-rc.13", optional = true, default-features = false }
 
 [features]
-default = ["llm_cli", "embed", "embed_api", "language", "systemone"]
+default = ["llm", "embed", "embed_api", "language", "systemone"]
 templating = ["dep:askama"]
 derives = ["dep:patterns-macros"]
-llm_cli = ["templating", "derives", "dep:schemars"]
+llm = ["templating", "derives", "dep:schemars", "dep:reqwest"]
 embed = [
     "dep:fastembed",
     "dep:ort",
@@ -103,12 +103,8 @@ allow_attributes_without_reason = "deny"
 # reference https://emschwartz.me/your-clippy-config-should-be-stricter/#my-configs
 
 [[test]]
-name = "stdin_null"
-required-features = ["llm_cli"]
-
-[[test]]
 name = "extractable_derive"
-required-features = ["llm_cli"]
+required-features = ["llm"]
 
 [[test]]
 name = "systemone_derive"

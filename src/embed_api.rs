@@ -1,5 +1,5 @@
 //! OpenAI-compatible embeddings client (`POST {base_url}/embeddings`), sibling
-//! to `embed`/`llm_cli`/`systemone`.
+//! to `embed`/`llm`/`systemone`.
 //!
 //! Backends differ only by `base_url` (`DeepInfra`, `OpenAI`, Together,
 //! `SiliconFlow`). The caller supplies base URL, API key, model and dimensions

@@ -127,6 +127,27 @@ impl Reranker {
             }
         }
     }
+
+    /// [`Self::rerank`] on the blocking pool, so an async caller cannot stall a
+    /// runtime worker for the duration of the ONNX runs.
+    ///
+    /// Takes owned inputs because `spawn_blocking` requires `'static`; reach for
+    /// [`Self::rerank`] when you already sit on a blocking thread (benchmarks,
+    /// sync code, nested offloads).
+    ///
+    /// # Errors
+    /// On tokenization or inference failure, a poisoned model lock, or a failed
+    /// blocking task.
+    pub async fn rerank_async(
+        self: Arc<Self>,
+        query: String,
+        docs: Vec<String>,
+        batch_size: Option<usize>,
+    ) -> Result<Vec<RerankHit>> {
+        tokio::task::spawn_blocking(move || self.rerank(&query, &docs, batch_size))
+            .await
+            .context("the rerank task failed")?
+    }
 }
 
 #[cfg(test)]

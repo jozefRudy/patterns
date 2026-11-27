@@ -15,7 +15,7 @@ patterns-macros = { path = "macros", optional = true }
 schemars = { version = "1", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["sync", "time"] }
+tokio = { version = "1", features = ["rt", "sync", "time"] }
 fastembed = { version = "=6.1.0", default-features = false, features = ["ort-download-binaries-native-tls", "hf-hub-native-tls"], optional = true }
 lingua = { version = "1.8.0", default-features = false, features = ["english", "french", "german", "spanish", "polish"], optional = true }
 # count-only tokenizer access (lock-free) — version pinned to fastembed's

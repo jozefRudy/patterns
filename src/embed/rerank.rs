@@ -28,8 +28,9 @@ pub struct RerankHit {
 /// `Reranker::fake` returns caller-supplied scores for tests.
 pub struct Reranker(Inner);
 
-/// Caller-supplied `score(query, doc)` for tests.
-type FakeScorer = Box<dyn Fn(&str, &str) -> f32 + Send + Sync>;
+/// Caller-supplied `score(query, doc)` for tests. `Arc` so a blocking task can
+/// own a clone, exactly like the loaded model.
+type FakeScorer = Arc<dyn Fn(&str, &str) -> f32 + Send + Sync>;
 
 /// Internals stay private so the public API isn't pinned to fastembed/ort types.
 enum Inner {
@@ -76,88 +77,93 @@ impl Reranker {
     /// Deterministic fake reranker: `score(query, doc)`, for tests.
     #[must_use]
     pub fn fake(score: impl Fn(&str, &str) -> f32 + Send + Sync + 'static) -> Self {
-        Self(Inner::Fake(Box::new(score)))
+        Self(Inner::Fake(Arc::new(score)))
     }
 
-    /// Score every `doc` against `query`, descending.
+    /// Score every `doc` against `query`, descending, on the blocking pool — an
+    /// async caller never stalls a runtime worker for the duration of the ONNX runs.
     ///
-    /// `batch_size` caps how many docs go through one ONNX run (`None` = 256).
-    /// Batching only splits the work into several runs with identical results;
-    /// smaller batches trade throughput for lower peak memory.
+    /// `batch_size` caps how many docs go through one ONNX run (`None` = 256): it
+    /// only splits the work into several runs with identical results, trading
+    /// throughput for lower peak memory.
     ///
-    /// Blocking CPU work under a shared lock (ONNX is not concurrently safe):
-    /// call from `spawn_blocking` in async contexts.
+    /// Inputs stay borrowed: the owned copies `spawn_blocking`'s `'static` bound
+    /// requires happen here, not at the call site.
     ///
     /// # Errors
-    /// On tokenization or inference failure, or a poisoned model lock.
-    pub fn rerank<S: AsRef<str>>(
+    /// On tokenization or inference failure, a poisoned model lock, or a failed
+    /// blocking task.
+    pub async fn rerank<S: AsRef<str> + Sync>(
         &self,
         query: &str,
         docs: &[S],
         batch_size: Option<usize>,
     ) -> Result<Vec<RerankHit>> {
         match &self.0 {
-            Inner::Fake(score) => {
-                let mut hits: Vec<RerankHit> = docs
-                    .iter()
-                    .enumerate()
-                    .map(|(index, doc)| RerankHit {
-                        index,
-                        score: score(query, doc.as_ref()),
-                    })
-                    .collect();
-                hits.sort_by(|a, b| b.score.total_cmp(&a.score));
-                Ok(hits)
-            }
+            // no inference, no lock: nothing worth a blocking thread, and no copy
+            Inner::Fake(score) => Ok(rerank_with_fake(score, query, docs)),
             Inner::FastEmbed(model) => {
-                let docs: Vec<&str> = docs.iter().map(AsRef::as_ref).collect();
-                let results = {
-                    let mut guard = model
-                        .lock()
-                        .map_err(|e| anyhow::anyhow!("reranker mutex poisoned: {e}"))?;
-                    guard.rerank(query, &docs, false, batch_size)?
-                };
-                Ok(results
-                    .into_iter()
-                    .map(|r| RerankHit {
-                        index: r.index,
-                        score: r.score,
-                    })
-                    .collect())
+                let model = Arc::clone(model);
+                let query = query.to_owned();
+                let docs: Vec<String> = docs.iter().map(|doc| doc.as_ref().to_owned()).collect();
+                tokio::task::spawn_blocking(move || {
+                    rerank_with_model(&model, &query, &docs, batch_size)
+                })
+                .await
+                .context("the rerank task failed")?
             }
         }
     }
+}
 
-    /// [`Self::rerank`] on the blocking pool, so an async caller cannot stall a
-    /// runtime worker for the duration of the ONNX runs.
-    ///
-    /// Takes owned inputs because `spawn_blocking` requires `'static`; reach for
-    /// [`Self::rerank`] when you already sit on a blocking thread (benchmarks,
-    /// sync code, nested offloads).
-    ///
-    /// # Errors
-    /// On tokenization or inference failure, a poisoned model lock, or a failed
-    /// blocking task.
-    pub async fn rerank_async(
-        self: Arc<Self>,
-        query: String,
-        docs: Vec<String>,
-        batch_size: Option<usize>,
-    ) -> Result<Vec<RerankHit>> {
-        tokio::task::spawn_blocking(move || self.rerank(&query, &docs, batch_size))
-            .await
-            .context("the rerank task failed")?
-    }
+/// Score every doc against `query` with a caller-supplied scorer (tests).
+fn rerank_with_fake<S: AsRef<str>>(score: &FakeScorer, query: &str, docs: &[S]) -> Vec<RerankHit> {
+    let mut hits: Vec<RerankHit> = docs
+        .iter()
+        .enumerate()
+        .map(|(index, doc)| RerankHit {
+            index,
+            score: score(query, doc.as_ref()),
+        })
+        .collect();
+    hits.sort_by(|a, b| b.score.total_cmp(&a.score));
+    hits
+}
+
+/// Score every doc against `query` with the loaded cross-encoder.
+fn rerank_with_model<S: AsRef<str>>(
+    model: &Mutex<TextRerank>,
+    query: &str,
+    docs: &[S],
+    batch_size: Option<usize>,
+) -> Result<Vec<RerankHit>> {
+    let docs: Vec<&str> = docs.iter().map(AsRef::as_ref).collect();
+    let results = {
+        let mut guard = model
+            .lock()
+            .map_err(|e| anyhow::anyhow!("reranker mutex poisoned: {e}"))?;
+        guard.rerank(query, &docs, false, batch_size)?
+    };
+    Ok(results
+        .into_iter()
+        .map(|r| RerankHit {
+            index: r.index,
+            score: r.score,
+        })
+        .collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn fake_rerank_orders_by_score() {
+    #[tokio::test]
+    async fn fake_rerank_orders_by_score() {
         let r = Reranker::fake(|_q, doc| f32::from(u8::try_from(doc.len()).unwrap_or(u8::MAX)));
-        let hits = r.rerank("q", &["a", "aaaa", "aa"], None).expect("rerank");
+        let hits = r
+            .rerank("q", &["a", "aaaa", "aa"], None)
+            .await
+            .expect("rerank");
         assert_eq!(hits.first().map(|h| h.index), Some(1), "longest first");
         assert_eq!(hits.last().map(|h| h.index), Some(0), "shortest last");
     }
@@ -182,6 +188,7 @@ mod tests {
                 &["errors in rust lifetimes", "banana bread recipe"],
                 None,
             )
+            .await
             .expect("rerank");
         assert_eq!(hit.first().map(|h| h.index), Some(0), "relevant doc first");
     }
